@@ -96,6 +96,11 @@ Use `printf`, never `echo`: a trailing newline produces a hash that never matche
 configuration holds hashes and never keys, so a leaked configuration file gives up nothing.
 Removing someone is removing their hash and running `docker compose up -d` again.
 
+A list means a list. It is checked against whatever credential arrives, not just the licence keys
+it is written in terms of, so nothing activates on your box without being on it. An empty
+`ENROLLMENT_HASHES` is not a way to say `*`: it refuses everything, on the grounds that a box
+nobody finished configuring should not be enrolling anyone.
+
 ## Put https in front
 
 The containers publish plain http on the host's loopback only. Terminate TLS in front of them.
@@ -133,7 +138,10 @@ so do it once, at setup.
 
 ## Admin
 
-Both admin surfaces are reachable only from inside the deployment, never over the network.
+Each server has an admin socket inside the deployment, and that is the channel to use: it is
+reachable only by something already on the box. The same commands also answer on the http
+listener, so if you installed without Docker, set `ADMIN_TOKEN` to something of your own before
+you put a proxy in front. The container generates one for you.
 
 Block a licence and revoke its devices:
 

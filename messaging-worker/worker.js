@@ -250,6 +250,39 @@ const MAX_APP_TRANSACTION_CHARS = 12000;
 // over the purchaser's.
 const appStoreHash = (appTransactionID) => sha256Hex(`appstore:${appTransactionID}`);
 
+/// May a credential that verified as this hash enrol on THIS box?
+///
+/// Self-hosted only. `ENROLLMENT_HASHES` does not exist hosted, where Gumroad is the enrolment
+/// decision and every paying customer is welcome, so `SELFHOST` unset answers yes to everything
+/// and none of this runs.
+///
+/// The list USED to be enforced entirely inside the offline Gumroad shim
+/// (selfhost/shared/gumroad.js), which works by wrapping `fetch`, so it only ever saw the
+/// Gumroad branch. An App Store credential verifies against the pinned Apple roots offline and
+/// never calls `fetch`, so it walked straight past a list an operator had set: any App Store
+/// copy of the app could enrol itself on a box restricted to named keys, over an endpoint that
+/// takes no authentication.
+///
+/// Deciding on the DERIVED hash, after whichever branch produced it, is what makes that a class
+/// of bug rather than one instance. It is deliberately NOT written as "refuse App Store
+/// credentials on-prem", which is what the client happens to enforce today: `#if APPSTORE`
+/// blocks custom servers to avoid a review conversation, not because Apple forbids it, so the
+/// day that ships this still works and an operator enrols an App Store user by hash like anyone
+/// else. Gumroad keys pass through it too, which is redundant with the shim and meant to be:
+/// the security boundary should not rest on a `fetch` wrapper.
+function enrolmentAllows(hash, env) {
+  if (env.SELFHOST !== "1") return true;
+  const configured = String(env.ENROLLMENT_HASHES ?? "").trim();
+  // Exactly "*", not a wildcard anywhere in the value, matching the shim: a list that happens to
+  // contain a stray asterisk is a typo, and reading it as "let everybody in" is the wrong way to
+  // resolve one.
+  if (configured === "*") return true;
+  // Unset is a half-configured box, and it fails closed. The Gumroad branch already answers 503
+  // there because the shim is not installed and the call escapes to a network that refuses it;
+  // this is what stops the App Store branch being the one credential such a box still took.
+  return configured.split(/[\s,]+/).filter(Boolean).some((h) => h.toLowerCase() === hash);
+}
+
 // One verifier per environment, built once per isolate and reused.
 //
 // Not just to skip re-parsing the two DER roots: `SignedDataVerifier` carries its own
@@ -519,6 +552,11 @@ async function activateDevice(request, env) {
       return fail(403, "revoked");
     }
   }
+
+  // BOTH branches, on the hash whichever one produced, and BEFORE the upsert below so a refused
+  // credential leaves no `licenses` row behind. See enrolmentAllows: the same 403 a key that is
+  // not on the list already gets from the shim, so the two paths answer alike.
+  if (!enrolmentAllows(hash, env)) return fail(403, "bad_license");
 
   // Never downgrade a BLOCKED license back to active on re-activation: blocked is our
   // decision about abuse, and neither Gumroad nor Apple has an opinion on it.

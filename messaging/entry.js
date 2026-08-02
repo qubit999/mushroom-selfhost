@@ -46,6 +46,12 @@ const decorate = (env) => {
   installOfflineGumroad(env.ENROLLMENT_HASHES);
   return {
     ...env,
+    // AFTER the spread, so no binding in config.capnp can turn it off. It is what tells
+    // `enrolmentAllows` in worker.js that ENROLLMENT_HASHES exists here at all: hosted has no
+    // such list, and an absent one there must not be read as an empty one. Until that check
+    // existed the list was enforced only by the `fetch` wrapper below, so it covered Gumroad
+    // keys and nothing else.
+    SELFHOST: "1",
     DB: makeD1(env.SQL.get(env.SQL.idFromName("db"))),
   };
 };
@@ -129,6 +135,15 @@ export class Admin extends WorkerEntrypoint {
       if (!identity) return new Response("identity required\n", { status: 400 });
       return this.env.INBOX.get(this.env.INBOX.idFromName(identity))
         .fetch("https://inbox/_selfhost/inbox");
+    }
+
+    // The operator commands in README.md. `/admin/*` lives in the worker's default fetch, which
+    // this entrypoint does not inherit, so the documented `curl --unix-socket` answered 404 and
+    // the only admin channel that actually worked was the http listener. Forward instead: the
+    // socket is scoped by the capnp binding rather than by a token, so it is the one an operator
+    // on the box should be reaching for.
+    if (url.pathname.startsWith("/admin/")) {
+      return base.fetch(request, decorate(this.env), this.ctx);
     }
 
     return new Response("not found\n", { status: 404 });

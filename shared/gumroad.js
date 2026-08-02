@@ -12,8 +12,17 @@
 /// and identity claiming. Nothing in worker.js moves.
 ///
 /// An App Store build cannot point at a custom server at all (ServerBase returns nil under
-/// #if APPSTORE), so on-prem is the direct build and therefore Gumroad only, and
-/// `verifyAppTransaction`'s air-gapped path is unreachable.
+/// #if APPSTORE), so on-prem is the direct build and therefore Gumroad only. That was a fact
+/// about the CLIENT, read as a property of this server, and it was neither: it is a choice to
+/// avoid a review conversation, not something Apple forbids, and `/v1/devices/activate` is an
+/// unauthenticated POST either way. Its `app_transaction` branch verifies against the pinned
+/// Apple roots offline, so it never calls `fetch` and never passed through the wrapper below,
+/// and anyone holding an App Store JWS could enrol on a box restricted to named keys.
+///
+/// The list is now applied by `enrolmentAllows` in both workers, to the hash whichever branch
+/// produced, so it covers every credential type and keeps covering them if that client
+/// restriction is ever lifted. This wrapper still answers Gumroad, and no longer carries the
+/// enrolment decision on its own.
 ///
 /// TWO MODES, and `*` is the default a container ships with.
 ///
@@ -31,8 +40,10 @@
 /// file yields nothing usable.
 ///
 /// Neither mode is the empty string. With nothing configured this installs NOTHING and every
-/// activation is a 503, which is what a half-configured box should do. The container never gets
-/// there: it refuses to start at all without a `.env`.
+/// Gumroad activation is a 503, which is what a half-configured box should do. (`enrolmentAllows`
+/// refuses an empty list too, with a 403, so the App Store branch is no longer the one credential
+/// a box nobody finished setting up still accepted.) The container never gets there: it refuses
+/// to start at all without a `.env`.
 
 const VERIFY_URL = "https://api.gumroad.com/v2/licenses/verify";
 
