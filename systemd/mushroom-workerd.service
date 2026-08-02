@@ -1,0 +1,49 @@
+[Unit]
+Description=Mushroom servers (workerd)
+Documentation=file:/opt/mushroom/README.md
+After=network.target mushroom-blobd.service
+Wants=mushroom-blobd.service
+
+[Service]
+Type=simple
+User=mushroom
+Group=mushroom
+WorkingDirectory=/opt/mushroom
+# workerd does not unlink its unix sockets on exit, and refuses to replace a stale one on
+# startup: it dies with `Address already in use` and, with Restart=always, crash-loops on that
+# forever. RuntimeDirectoryPreserve keeps /run/mushroom across a restart (it has to, blobd is
+# using it), so the stale sockets survive too. This bites on `systemctl restart`, never on a
+# first boot. blobd.mjs already does the same for its own socket.
+ExecStartPre=-/bin/rm -f /run/mushroom/admin.sock /run/mushroom/files-admin.sock
+# The config must be run from the directory holding it, because capnp resolves `import`
+# relative to the importing file and config.capnp imports dist/*/modules.capnp.
+ExecStart=/opt/mushroom/node_modules/.bin/workerd serve /opt/mushroom/config.capnp
+Restart=always
+RestartSec=2
+
+# Shared with mushroom-blobd.service; see the note there about why Preserve matters.
+RuntimeDirectory=mushroom
+RuntimeDirectoryPreserve=yes
+StateDirectory=mushroom
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+# The durable-object directories: messages and both databases live here.
+ReadWritePaths=/var/lib/mushroom
+
+# Listens on loopback for the proxy in front, and on unix sockets for the admin routes and the
+# blob store. It never makes an outbound connection: config.capnp points globalOutbound at a
+# network service that allows nothing. This is the same claim enforced a second way, at the
+# system level, where it is checkable with `systemctl show` rather than by reading a capnp file.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressAllow=localhost
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

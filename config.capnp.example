@@ -1,0 +1,144 @@
+using Workerd = import "/workerd/workerd.capnp";
+using MessagingModules = import "dist/messaging/modules.capnp";
+using FilesModules = import "dist/files/modules.capnp";
+
+# Mushroom on your own hardware.
+#
+# Copy this file, fill in the CHANGE ME values, and run:
+#   workerd serve config.capnp
+#
+# Start selfhost/blobd.mjs alongside it, or uploads have nowhere to go. Both have systemd units
+# in selfhost/systemd.
+#
+# This deployment cannot make an outbound request, which is a stronger thing to hand a security
+# team than any application-level allowlist.
+#
+# That is enforced by `globalOutbound = "no-internet"` on each worker, and it has to be.
+# LEAVING THE `internet` SERVICE UNDEFINED DOES NOTHING: workerd defaults globalOutbound to a
+# real network service, so a config without these lines reaches the public internet. Verified
+# rather than assumed. Do not delete the service below thinking it is redundant.
+
+const config :Workerd.Config = (
+  services = [
+    (name = "messaging", worker = .messaging),
+    (name = "files", worker = .files),
+
+    # Durable Object storage. These directories hold BOTH the message ciphertext and the
+    # databases, which is what makes the backup story two directories and no more.
+    (name = "do-messaging", disk = (path = "/var/lib/mushroom/do-messaging", writable = true)),
+    (name = "do-files", disk = (path = "/var/lib/mushroom/do-files", writable = true)),
+
+    # The blob store, standing in for R2. NOT a workerd `disk` service: that serves GET and HEAD
+    # only, with no DELETE and no Range, and both are load-bearing here. selfhost/blobd.mjs
+    # listens on this socket.
+    (name = "blobs", external = (address = "unix:/run/mushroom/blobd.sock", http = ())),
+
+    # An outbound network that allows nothing. See the note at the top: this is what actually
+    # makes the box unable to phone home, and it is load-bearing rather than decorative.
+    #
+    # An empty allow list is the whole mechanism. Do not add a `deny` list to "reinforce" it:
+    # workerd rejects denying 'public' at startup and the process dies on a fatal exception.
+    (name = "no-internet", network = (allow = [])),
+  ],
+
+  sockets = [
+    # Plain http on loopback. TLS is terminated in front of these, because the app refuses
+    # anything that is not https and Apple's ATS has no exemption in either build.
+    #
+    # NOTE THE CROSSING. The FILES worker gets the bare :443 address, because `PUBLIC_BASE` is
+    # the one address that is ever seen by a human who is not running Mushroom: it is baked into
+    # every share link and travels to whoever the file was sent to. Friends takes the port.
+    #
+    #   tailscale serve --bg --https=443  http://127.0.0.1:8081     # file sharing
+    #   tailscale serve --bg --https=8443 http://127.0.0.1:8080     # friends
+    #
+    # tailscale renews its own certificate, which is why it beats `tailscale cert` plus workerd
+    # TLS sockets. A customer with internal PKI and their own DNS name can use an `https` socket
+    # group with tlsOptions instead.
+    (name = "messaging-http", address = "127.0.0.1:8080", http = (), service = "messaging"),
+    (name = "files-http", address = "127.0.0.1:8081", http = (), service = "files"),
+
+    # Operator and test surface, on unix sockets only, so they are unreachable over the network
+    # no matter what the proxy in front is configured to forward.
+    (name = "messaging-admin", address = "unix:/run/mushroom/admin.sock", http = (),
+     service = (name = "messaging", entrypoint = "Admin")),
+    (name = "files-admin", address = "unix:/run/mushroom/files-admin.sock", http = (),
+     service = (name = "files", entrypoint = "Admin")),
+  ],
+);
+
+const messaging :Workerd.Worker = (
+  modules = MessagingModules.modules,
+
+  # Copied from messaging-worker/wrangler.jsonc and must move with it, or the two environments
+  # stop being the same runtime.
+  compatibilityDate = "2026-07-25",
+  compatibilityFlags = ["nodejs_compat"],
+
+  # Where `fetch()` goes. Without this line it goes to the real internet.
+  globalOutbound = "no-internet",
+
+  durableObjectNamespaces = [
+    (className = "UserInbox", uniqueKey = "CHANGE-ME-mushroom-inbox", enableSql = true),
+    (className = "SqlStore", uniqueKey = "CHANGE-ME-mushroom-sql", enableSql = true),
+  ],
+  durableObjectStorage = (localDisk = "do-messaging"),
+
+  bindings = [
+    (name = "INBOX", durableObjectNamespace = "UserInbox"),
+    (name = "SQL", durableObjectNamespace = "SqlStore"),
+
+    # The whole box shares one activation bucket, because there is no `cf-connecting-ip` behind
+    # a local proxy. A tailnet has no per-IP abuse problem, so this stays only as a
+    # runaway-client bound rather than a real limit.
+    (name = "ACTIVATIONS_PER_HOUR_PER_IP", text = "1000"),
+
+    # A public constant, not a secret. Leave it as it is.
+    (name = "APPSTORE_APP_APPLE_ID", text = "6792833686"),
+
+    # Leave APNS_* unset. Background notifications are not available on a self-hosted deployment,
+    # and unset is what makes that automatic: no token is stored and no timer is ever armed.
+
+    # CHANGE ME. `*` accepts any licence key, which is the recommended setting. To restrict this
+    # deployment to keys you have named, use a space-separated list of hashes instead:
+    #   printf '%s' 'THEIR-KEY' | tr '[:lower:]' '[:upper:]' | shasum -a 256
+    # Use printf, never echo: a trailing newline produces a hash that never matches.
+    (name = "ENROLLMENT_HASHES", text = "*"),
+
+    (name = "ADMIN_TOKEN", text = "CHANGE-ME"),
+  ],
+);
+
+const files :Workerd.Worker = (
+  modules = FilesModules.modules,
+
+  compatibilityDate = "2026-07-25",
+  compatibilityFlags = ["nodejs_compat"],
+  globalOutbound = "no-internet",
+
+  durableObjectNamespaces = [
+    (className = "SqlStore", uniqueKey = "CHANGE-ME-mushroom-files-sql", enableSql = true),
+  ],
+  durableObjectStorage = (localDisk = "do-files"),
+
+  bindings = [
+    (name = "SQL", durableObjectNamespace = "SqlStore"),
+    (name = "BLOBS", service = "blobs"),
+
+    # CHANGE ME, and get it right. This goes into every share link this deployment hands out, so
+    # a wrong value gives people links pointing somewhere else for files that live here. Include
+    # the port if you serve files on one, which is why files is the worker that gets :443.
+    #
+    # dev-config.sh substitutes this by matching the literal below. The two move together.
+    (name = "PUBLIC_BASE", text = "https://CHANGE-ME.example.ts.net"),
+
+    (name = "APPSTORE_APP_APPLE_ID", text = "6792833686"),
+
+    # Leave TURNSTILE_SECRET_KEY and the EMAIL binding unset. In-app abuse reporting is not
+    # available on a self-hosted deployment.
+
+    # CHANGE ME. See the note on the messaging worker above.
+    (name = "ENROLLMENT_HASHES", text = "*"),
+    (name = "ADMIN_TOKEN", text = "CHANGE-ME"),
+  ],
+);

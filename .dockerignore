@@ -1,0 +1,26 @@
+# Build output and local state. dist/ in particular MUST be excluded: a stale one copied in
+# would be silently served instead of the one build.sh produces during the image build.
+dist/
+node_modules/
+.wrangler/
+.wrangler-dev-state/
+do-messaging/
+do-files/
+blobs/
+
+# Secrets and anything pointing at OUR deployment. Same list as .gitignore, for the same reason:
+# an image is as publishable as a repo, and these are the files that must never travel.
+config.capnp
+.env
+secrets.env
+.dev.vars
+**/.dev.vars
+messaging-worker/wrangler.jsonc
+files-worker/wrangler.jsonc
+messaging-worker/wrangler.test.jsonc
+files-worker/wrangler.test.jsonc
+.test-*.capnp
+
+.git/
+.DS_Store
+*.log

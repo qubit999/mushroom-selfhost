@@ -1,0 +1,12 @@
+[Unit]
+Description=Mushroom database backup, nightly
+Documentation=file:/opt/mushroom/README.md
+
+[Timer]
+OnCalendar=daily
+# Catch up after the box has been off, rather than skipping a night silently.
+Persistent=true
+RandomizedDelaySec=30m
+
+[Install]
+WantedBy=timers.target

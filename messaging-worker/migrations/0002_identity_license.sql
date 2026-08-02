@@ -1,0 +1,14 @@
+-- Bind an identity to the license that first claimed it.
+--
+-- A public key is not a secret: `/v1/friends` hands it to every friend, the `friend_added`
+-- frame pushes it, and accepting an invite returns the inviter's. `identity_id` is
+-- sha256(public_key), so before this column anyone holding their own valid license could
+-- post somebody else's public key to /v1/devices/activate and be issued a token for that
+-- identity. The message bodies were still sealed, but the friend list, the stored ciphertext,
+-- the push registration and `remove` (which deletes messages) were all reachable.
+--
+-- X25519 keys cannot sign, so there is no challenge to answer and no cheaper proof of
+-- possession available. First claim wins is the whole scheme: nullable, so rows written
+-- before this migration bind to whoever activates them next rather than locking out the
+-- Mac that already owns them.
+ALTER TABLE identities ADD COLUMN license_hash TEXT;

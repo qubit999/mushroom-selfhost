@@ -1,0 +1,27 @@
+[Unit]
+Description=Mushroom database backup
+Documentation=file:/opt/mushroom/README.md
+
+[Service]
+Type=oneshot
+User=mushroom
+Group=mushroom
+ExecStart=/opt/mushroom/backup.sh
+
+Environment=STATE_ROOT=/var/lib/mushroom
+Environment=DEST=/var/backups/mushroom
+Environment=KEEP=3
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+# Read-write on the state directory, which looks wrong for a backup and is not.
+#
+# These databases are in WAL mode, and opening a WAL database requires write access to its
+# -shm file even for a pure reader. ReadOnlyPaths here makes `sqlite3 .backup` fail to open
+# the source at all. The alternative, copying the files instead, is the thing this script
+# exists to avoid: a copy taken mid-write restores corrupt.
+ReadWritePaths=/var/lib/mushroom /var/backups/mushroom
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any

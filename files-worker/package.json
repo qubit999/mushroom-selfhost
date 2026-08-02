@@ -1,0 +1,8 @@
+{
+  "name": "mushroom-files",
+  "private": true,
+  "description": "Dependency exists only for the App Store activation path: SignedDataVerifier verifies AppTransaction JWS. Run npm install here before wrangler deploy. Pinned exactly, same rule as the app's own dependencies (CLAUDE.md §12).",
+  "dependencies": {
+    "@apple/app-store-server-library": "3.1.0"
+  }
+}

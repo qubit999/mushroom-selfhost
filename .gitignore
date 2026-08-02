@@ -1,0 +1,49 @@
+# This tree is published. Everything below either holds a secret, points at OUR deployment, or
+# is build output, and none of it belongs in a public repo.
+#
+# The publish script (publish-selfhost.sh) works from an allowlist and does not rely on this
+# file, deliberately: two independent mechanisms, because the cost of one of them being wrong
+# once is a live database id on the internet.
+
+# The REAL deployment configs. These carry the live D1 database ids of our hosted deployment.
+# Untracked on purpose, and kept on disk so `wrangler deploy` still works from a dev machine.
+# A fresh clone has to recreate them from wrangler.example.jsonc, which is tracked.
+messaging-worker/wrangler.jsonc
+files-worker/wrangler.jsonc
+
+# Throwaway configs for the custom-servers end-to-end run.
+messaging-worker/wrangler.test.jsonc
+files-worker/wrangler.test.jsonc
+
+# Local secrets: APNs signing keys, admin tokens, Turnstile keys.
+.dev.vars
+**/.dev.vars
+
+# A filled-in on-prem config holds ADMIN_TOKEN and the enrollment hashes.
+# config.capnp.example IS tracked; this is the copy an operator edits.
+# Under Docker it is derived at container start and never written to the host at all.
+config.capnp
+
+# The Docker deployment's two. .env.example IS tracked; .env is the copy an operator edits, and
+# secrets.env holds the generated admin token and durable-object keys.
+.env
+secrets.env
+
+# Throwaway workerd configs written by the test scripts.
+.test-*.capnp
+
+# Build output: bundles and the generated capnp module lists.
+dist/
+
+# Dependencies, and wrangler's local state.
+node_modules/
+.wrangler/
+.wrangler-dev-state/
+
+# Durable-object state and blobs, if anyone runs a box from inside the checkout.
+do-messaging/
+do-files/
+blobs/
+
+.DS_Store
+*.log

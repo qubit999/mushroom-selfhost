@@ -1,0 +1,99 @@
+# Mushroom on your own hardware.
+#
+#   cp .env.example .env    # fill in PUBLIC_BASE
+#   docker compose up -d
+#
+# Four services out of one image, replacing the six systemd units in systemd/ (still there, for
+# anyone who would rather not run Docker). Same paths, so the same scripts run unchanged.
+
+name: mushroom
+
+# One image, built once. Every service is the same tree with a different command.
+x-mushroom: &mushroom
+  build:
+    context: .
+    args:
+      # Set BASE in .env to build from your own mirror, which an air-gapped install needs anyway.
+      BASE: ${BASE:-node:22-slim}
+  image: mushroom-selfhost
+  restart: unless-stopped
+
+services:
+  # R2's stand-in. Serves a unix socket only and speaks to nobody else, which is why it is not on
+  # any network at all.
+  blobd:
+    <<: *mushroom
+    command: node blobd.mjs
+    network_mode: none
+    environment:
+      BLOB_ROOT: /var/lib/mushroom/blobs
+      BLOB_SOCKET: /run/mushroom/blobd.sock
+    volumes:
+      - state:/var/lib/mushroom
+      - run:/run/mushroom
+
+  workerd:
+    <<: *mushroom
+    # The entrypoint derives config.capnp from .env plus the generated secrets, then execs this.
+    entrypoint: ./docker-entrypoint.sh
+    command: node_modules/.bin/workerd serve config.capnp
+    env_file: .env
+    volumes:
+      - state:/var/lib/mushroom
+      - run:/run/mushroom
+    # Published on the host's loopback, because TLS is terminated in front (see README). Both are
+    # plain http and neither should ever be reachable from outside this machine.
+    #
+    # NOTE THE CROSSING when you put a proxy in front: 8081 is FILES and gets the bare :443
+    # address, because PUBLIC_BASE ends up in every share link. 8080 is friends and takes :8443.
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8081:8081"
+    depends_on:
+      - blobd
+
+  # workerd has no cron, and `triggers.crons` is a Cloudflare platform feature that never fires
+  # here. A systemd timer did this before; a loop does it now.
+  #
+  # `systemctl list-timers` was chosen originally because a sweep that silently stopped running is
+  # the failure worth catching. The equivalents here are `docker compose ps` (the container is
+  # gone or restarting) and `docker compose logs cron` (cron.sh already prints to stderr and exits
+  # non-zero). `|| true` keeps the loop alive through a transient failure without hiding it.
+  #
+  # Sleep first, so a boot does not sweep before workerd has opened its sockets.
+  cron:
+    <<: *mushroom
+    command: sh -c 'while :; do sleep 3600; ./cron.sh || true; done'
+    environment:
+      ADMIN_SOCK: /run/mushroom/admin.sock
+      FILES_ADMIN_SOCK: /run/mushroom/files-admin.sock
+      BLOB_ROOT: /var/lib/mushroom/blobs
+      # Must match TTL_SECONDS in files-worker/worker.js. The filesystem backstop deletes blobs
+      # older than twice this, so a wrong value here deletes bytes out from under rows the
+      # database still calls ready.
+      TTL_HOURS: "24"
+    network_mode: none
+    volumes:
+      - state:/var/lib/mushroom
+      - run:/run/mushroom
+    depends_on:
+      - workerd
+
+  backup:
+    <<: *mushroom
+    command: sh -c 'while :; do sleep 86400; ./backup.sh || true; done'
+    environment:
+      STATE_ROOT: /var/lib/mushroom
+      DEST: /var/backups/mushroom
+      KEEP: "3"
+    network_mode: none
+    volumes:
+      - state:/var/lib/mushroom
+      - backups:/var/backups/mushroom
+
+volumes:
+  # Both durable-object trees, the blobs, and secrets.env. This is the volume that matters.
+  state:
+  # The three unix sockets, shared between containers. Disposable.
+  run:
+  backups:

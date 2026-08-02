@@ -1,0 +1,47 @@
+Mushroom self-hosted servers
+Copyright 2026 Alexander Slatina
+
+This product includes software developed by Alexander Slatina, licensed under the
+Apache License, Version 2.0. See the LICENSE file for the full terms.
+
+"Mushroom" and the Mushroom name and logo are trademarks of Alexander Slatina. The
+Apache License grants no trademark rights (see section 6 of the License): you may run,
+modify and redistribute this software, but not use the Mushroom name or branding to
+identify your own distribution of it.
+
+--------------------------------------------------------------------------------------
+Third-party material NOT covered by the Apache License
+--------------------------------------------------------------------------------------
+
+worker-shared/apple-roots.js contains two X.509 root certificates published by Apple
+Inc.: "Apple Root CA - G2" and "Apple Root CA - G3", stored as base64-encoded DER.
+
+Those certificates are the property of Apple Inc. They are reproduced here unmodified,
+as public cryptographic trust anchors, so that App Store purchase receipts can be
+verified offline against a pinned root rather than one fetched at runtime. They are
+obtained from Apple's public certificate authority page:
+
+    https://www.apple.com/certificateauthority/
+
+No licence to those certificates is granted by this project, and none is claimed over
+them. They are not a contribution to this work within the meaning of the Apache License,
+and nothing in that License applies to them. Redistribution of public root certificates
+is ordinary practice: every operating system, browser and language runtime ships a
+comparable set.
+
+If you fork this project, do not treat those values as source code to be edited. Rotating
+them means downloading the current certificates from Apple and replacing them wholesale,
+in both workers at once, as the file's own header explains.
+
+--------------------------------------------------------------------------------------
+Dependencies
+--------------------------------------------------------------------------------------
+
+This repository declares its dependencies but does not redistribute them; `npm install`
+fetches them from the npm registry. At the time of writing they are, in full:
+
+    workerd                                Apache-2.0    (Cloudflare, Inc.)
+    @apple/app-store-server-library        MIT           (Apple Inc.)
+
+together with their transitive dependencies, which are MIT, Apache-2.0, BSD-2-Clause,
+BSD-3-Clause and ISC. No dependency carries a copyleft licence.

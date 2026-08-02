@@ -1,0 +1,42 @@
+[Unit]
+Description=Mushroom blob store
+Documentation=file:/opt/mushroom/README.md
+# workerd connects to this socket lazily, on the first upload or download, so strict ordering is
+# not required for correctness. It is here so a boot does not log a confusing first failure.
+Before=mushroom-workerd.service
+
+[Service]
+Type=simple
+User=mushroom
+Group=mushroom
+ExecStart=/usr/bin/node /opt/mushroom/blobd.mjs
+Restart=always
+RestartSec=2
+
+Environment=BLOB_ROOT=/var/lib/mushroom/blobs
+Environment=BLOB_SOCKET=/run/mushroom/blobd.sock
+
+# /run/mushroom is shared with mushroom-workerd.service, which declares it too.
+# RuntimeDirectoryPreserve is what stops one unit's shutdown from deleting the directory the
+# other is still using, taking its sockets with it.
+RuntimeDirectory=mushroom
+RuntimeDirectoryPreserve=yes
+StateDirectory=mushroom
+
+# This process turns strings off a socket into filesystem paths, so it gets the narrowest
+# filesystem it can still do its job with.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=/var/lib/mushroom/blobs
+# No network of any kind: it listens on a unix socket and speaks to nobody.
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+{
+  "name": "mushroom-selfhost",
+  "private": true,
+  "description": "Runs the two Workers on hardware a customer owns. workerd is the production self-hosting runtime, NOT Miniflare, which is a test simulator. Pinned exactly, same rule as every other dependency in this project (CLAUDE.md section 12): a range here would let a clean checkout resolve the runtime holding a company's messages to whatever is newest that day.",
+  "dependencies": {
+    "workerd": "1.20260801.1"
+  }
+}

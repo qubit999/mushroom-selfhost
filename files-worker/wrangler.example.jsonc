@@ -1,0 +1,79 @@
+// EXAMPLE. Copy to wrangler.jsonc and fill in your own values.
+//
+// The real wrangler.jsonc is not published: it carries the live database ids of our
+// hosted deployment. Every placeholder below is marked, and `wrangler d1 create` and
+// `wrangler r2 bucket create` print the values you need.
+//
+// This file is for running the Workers in YOUR OWN Cloudflare account (deploy/README.md).
+// Running them on your own hardware needs none of it: see selfhost/README.md.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mushroom-files",
+  "main": "worker.js",
+  "compatibility_date": "2026-07-25",
+
+  // Required by the App Store activation path: @apple/app-store-server-library
+  // needs node builtins (Buffer, crypto). The import itself is deliberately inside the
+  // request handler, not at module scope, because jsrsasign generates randomness while
+  // its module body runs and workerd refuses that in global scope. See worker.js.
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Deliberately NO "assets" block. The website worker (Mushroom_www) serves every
+  // repo-root file as a static asset and matches assets BEFORE code, so a file named
+  // like a route would silently shadow it. This worker is code only.
+
+  "observability": { "enabled": true },
+
+  // NO "ratelimits" binding here, and that is a decision rather than an omission. The per-IP
+  // cap on /v1/devices/activate is a D1 counter in worker.js instead, because Cloudflare's
+  // own Rate Limiting binding was tried here first and measured not to enforce for this
+  // account: 139 requests from one IP inside a minute, against a configured 30 per 60
+  // seconds, every one of them answered `{"success":true}`. Verify with a burst against the
+  // deployed Worker before ever swapping it back.
+
+  "vars": {
+    // The App Store build presents AppTransaction's JWS instead of a Gumroad key, and
+    // Apple's verifier needs the app's numeric App Store id to check it against the
+    // right app. Public, not a secret: it is the id in every App Store URL, which is why
+    // it sits here in version control rather than in a wrangler secret nobody can see.
+    "APPSTORE_APP_APPLE_ID": "6792833686",
+    "PUBLIC_BASE": "https://files.getmushroom.app"
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mushroom-files",
+      "database_id": "PUT-YOUR-OWN-D1-DATABASE-ID-HERE",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  "r2_buckets": [
+    {
+      "binding": "FILES",
+      "bucket_name": "your-bucket-name"
+      // Deliberately NO "jurisdiction". R2 Local Uploads, which is what makes an upload
+      // from outside Europe quick, is not supported on a bucket that has one. Jurisdiction
+      // is fixed at creation, so switching cost a whole new bucket and buys nothing back
+      // if it is re-added. The bucket carries a weur location hint instead: the data still
+      // sits in Western Europe, it is just no longer a guarantee. privacy.html says so.
+    }
+  ],
+
+  // Abuse report notifications. Locked to the one destination it is ever allowed to
+  // reach: a bug or an injection in the report path then cannot turn this Worker into an
+  // open relay. The sender (abuse@getmushroom.app) needs no mailbox, only a domain
+  // onboarded to Email Sending.
+  "send_email": [
+    { "name": "EMAIL", "destination_address": "you@example.com" }
+  ],
+
+  // Hourly sweep. The minute is arbitrary and deliberately not :00, where every cron on
+  // the platform piles up.
+  "triggers": { "crons": ["17 * * * *"] },
+
+  "routes": [
+    { "pattern": "files.example.com", "custom_domain": true }
+  ]
+}
