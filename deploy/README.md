@@ -6,9 +6,11 @@ in **your own Cloudflare account** instead. Your data then lives in your D1 data
 bucket and your Durable Objects, under your contract with Cloudflare, in the region you pick,
 with a delete button only you can press.
 
-We can still see nothing either way: friend messages are end to end encrypted on the sending
-Mac and our Worker only ever stores ciphertext. What changes is **files**, which are not
-encrypted, and who the data processor is.
+We can still see nothing either way. Friend messages are end to end encrypted on the sending
+Mac, and since 1.38.0 so are shared files: the Mac seals each one before it leaves, with a key
+that lives only in the fragment of the share link, which no browser ever puts in a request. Your
+Worker stores ciphertext and holds no key, exactly as ours does. What changes here is **who the
+data processor is**, and where the bytes and the filenames sit.
 
 If your organisation needs to go further than that, and run the servers on **hardware it owns**
 with no Cloudflare in the path at all, that is a different setup: see `selfhost/README.md`. It is
@@ -55,9 +57,17 @@ above), keeping `"binding": "DB"`
 exactly as it is, then set `PUBLIC_BASE` and the route to your hostname:
 
 ```jsonc
-"vars": { "PUBLIC_BASE": "https://files.example.com" },
+"vars": {
+  "PUBLIC_BASE": "https://files.example.com",
+  "BRAND_URL": ""
+},
 "routes": [{ "pattern": "files.example.com", "custom_domain": true }]
 ```
+
+`BRAND_URL` is where the "this link has expired" and "this file was removed" pages send a
+visitor, and where the bare root redirects. Empty means your deployment names nobody, which is
+what you want: left unset it falls back to our marketing site, and your recipients would be sent
+to us. Set it to your own intranet page if you would rather it pointed somewhere.
 
 ```bash
 npx wrangler r2 bucket create mushroom-files --location <eu|wnam|apac>
@@ -130,7 +140,11 @@ This is in the direct download only, not the Mac App Store build.
   deliberately never carries.
 - **Abuse reporting.** The public report form needs Turnstile keys and an onboarded sending
   domain. On a private deployment there is no public link surface to report, so leaving
-  `TURNSTILE_SECRET_KEY` unset and the `send_email` binding off is correct.
+  `TURNSTILE_SECRET_KEY` unset and the `send_email` binding off is correct. If you do want it,
+  serve your own copy of `report.html` and add its origin to `REPORT_ORIGINS` (comma separated),
+  or the Worker will refuse your page in favour of ours. Note that you will not be able to look
+  at a reported file: it is encrypted and you hold no key, so a takedown is a decision about the
+  report, and `/admin/files/delete` removes the file without anybody reading it.
 - **Licence checking is still ours.** Both Workers verify each activation against Gumroad, so
   they need outbound internet. Purchases through the Mac App Store verify offline against
   pinned Apple roots and need no reachability at all.

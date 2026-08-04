@@ -27,6 +27,9 @@ FILES_PORT="${FILES_PORT:-$((PORT + 1))}"
 FILES_SOCK="${FILES_SOCK:-$STATE/files-admin.sock}"
 BLOB_SOCK="${BLOB_SOCK:-$STATE/blobd.sock}"
 PUBLIC_BASE="${PUBLIC_BASE:-http://127.0.0.1:$FILES_PORT}"
+# Empty is the shipped default, and it is meaningful: the expired and removed pages then link
+# nobody and the root answers 404, rather than a box that is not ours advertising us.
+BRAND_URL="${BRAND_URL:-}"
 
 # The listen address. Loopback is right for a test box and for systemd, where the proxy in front
 # is on the same machine. A CONTAINER must set 0.0.0.0: 127.0.0.1 inside a container is the
@@ -45,8 +48,15 @@ UNIQUE_KEY="${UNIQUE_KEY:-CHANGE-ME-mushroom}"
 # which is correct fail-closed behaviour but is not what the suites are trying to measure. So a
 # test box is enrolled by default, with the hash of a documented throwaway key. Override ENROLL
 # to enrol a real key when exercising activation by hand.
+#
+# ONE dash, matching docker-entrypoint.sh, and for a sharper reason than symmetry. An empty
+# ENROLL means an operator deliberately blanked ENROLLMENT_HASHES, which has to reach the Worker
+# as empty so `enrolmentAllows` refuses every activation. With `:-` it did not: empty read as
+# unset and this line quietly enrolled the hash below, so blanking the list produced a box that
+# accepted exactly one key, the throwaway one written in this file and published with it.
+# Unset still means "nobody set this, it is a test box", which is what the default is for.
 TEST_LICENCE_KEY="${TEST_LICENCE_KEY:-SELFHOST-TEST-LICENCE}"
-ENROLL="${ENROLL:-$(printf '%s' "$TEST_LICENCE_KEY" | tr '[:lower:]' '[:upper:]' | shasum -a 256 | cut -d' ' -f1)}"
+ENROLL="${ENROLL-$(printf '%s' "$TEST_LICENCE_KEY" | tr '[:lower:]' '[:upper:]' | shasum -a 256 | cut -d' ' -f1)}"
 
 # Test-only bindings, appended after each ADMIN_TOKEN. None of these are in the shipped example,
 # and that is the point: a real box has no SQL route and no APNs key.
@@ -77,6 +87,7 @@ sed -e "s#/var/lib/mushroom/do-messaging#$STATE/do-messaging#" \
     -e "s#address = \"127.0.0.1:8080\"#address = \"$BIND:$PORT\"#" \
     -e "s#address = \"127.0.0.1:8081\"#address = \"$BIND:$FILES_PORT\"#" \
     -e "s#https://CHANGE-ME.example.ts.net#$PUBLIC_BASE#" \
+    -e "s#(name = \"BRAND_URL\", text = \"\")#(name = \"BRAND_URL\", text = \"$BRAND_URL\")#" \
     -e "s#CHANGE-ME-mushroom-inbox#$UNIQUE_KEY-inbox#" \
     -e "s#CHANGE-ME-mushroom-files-sql#$UNIQUE_KEY-files-sql#" \
     -e "s#CHANGE-ME-mushroom-sql#$UNIQUE_KEY-sql#" \

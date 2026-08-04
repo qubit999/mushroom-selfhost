@@ -134,8 +134,21 @@ const files :Workerd.Worker = (
 
     (name = "APPSTORE_APP_APPLE_ID", text = "6792833686"),
 
-    # Leave TURNSTILE_SECRET_KEY and the EMAIL binding unset. In-app abuse reporting is not
-    # available on a self-hosted deployment.
+    # Where the "this link has expired" and "this file was removed" pages send a visitor, and
+    # where the bare root redirects. Empty means this deployment names nobody: the root answers
+    # 404 and those pages carry no link, which is the right default for a box that has nothing
+    # to do with us. Set it to your own site if you would rather it pointed somewhere.
+    #
+    # docker-entrypoint.sh substitutes this from BRAND_URL in .env. The two move together.
+    (name = "BRAND_URL", text = ""),
+
+    # Leave TURNSTILE_SECRET_KEY and the EMAIL binding unset, and the in-app abuse report form
+    # stays off: it needs a Turnstile secret to check the submission and an EMAIL binding to
+    # deliver it. Handle misuse through your own policies and the admin commands instead.
+    #
+    # If you do serve your own copy of report.html, add REPORT_ORIGINS as well, comma separated,
+    # or the Worker refuses your page's origin in favour of ours:
+    #   (name = "REPORT_ORIGINS", text = "https://intranet.example.com"),
 
     # CHANGE ME. See the note on the messaging worker above.
     (name = "ENROLLMENT_HASHES", text = "*"),

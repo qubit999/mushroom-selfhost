@@ -36,12 +36,34 @@ const REPORT_CONTACT_SECONDS = 30 * 24 * 60 * 60;    // then name/email are clea
 const REPORT_RETENTION_SECONDS = 180 * 24 * 60 * 60; // then the row goes
 const REPORT_RETRY_BATCH = 10;
 
-/// The only origins the report form may be served from. The form is the sole browser
-/// caller of this Worker; everything else is the Mac app, which sends no Origin.
-const REPORT_ORIGINS = ["https://getmushroom.app", "https://www.getmushroom.app"];
+/// The only origins the report form may be served from. The form is one of two browser
+/// callers of this Worker (the other is the receive page, which is served from here and so
+/// needs no CORS at all); everything else is the Mac app, which sends no Origin.
+///
+/// Overridable with the `REPORT_ORIGINS` var, comma separated, so a self-hosted deployment
+/// serving its own copy of the form is not rejected by our hostnames. Defaulted rather than
+/// required, so our own deploy cannot regress by forgetting to set it.
+const DEFAULT_REPORT_ORIGINS = ["https://getmushroom.app", "https://www.getmushroom.app"];
+
+function reportOrigins(env) {
+  const configured = String(env.REPORT_ORIGINS ?? "").split(",").map((o) => o.trim()).filter(Boolean);
+  return configured.length ? configured : DEFAULT_REPORT_ORIGINS;
+}
+
 const REPORT_ACTION = "report";
 const ABUSE_FROM = "abuse@getmushroom.app";   // send only, there is no such mailbox
 const ABUSE_TO = "hello@getmushroom.app";
+
+/// Where a stranger is sent when they land on this Worker with no link: the root, and the
+/// footer of the expired and removed pages.
+///
+/// `BRAND_URL` exists because those two pages are the only thing a self-hoster's recipients
+/// ever see, and they used to advertise getmushroom.app from a box we have nothing to do
+/// with. Set it to empty and this deployment names nobody: the root answers 404 and the
+/// pages carry no link. Defaulted to ours so our own deploy cannot regress.
+function brandURL(env) {
+  return env.BRAND_URL === undefined ? "https://www.getmushroom.app" : String(env.BRAND_URL).trim();
+}
 
 /// Same reply every well-formed submission gets, whether the link was real, already
 /// expired, a duplicate, or never existed. Confirming that a token resolves would turn
@@ -666,7 +688,14 @@ async function uploadContent(request, env, auth, id) {
 
   // The declared type was checked at create time; this is where the actual bytes are
   // checked. A renamed .exe claiming to be a PNG dies here, before its link works.
-  if (!(await storedBytesMatchType(env, key, row.content_type))) {
+  //
+  // Except when the client sealed the file, which since 1.38.0 it always does: those bytes
+  // are ciphertext and match no signature, so the check would refuse every upload. This is
+  // not a hole somebody opens with a header, it is the honest consequence of the server no
+  // longer being able to see the file at all. A client that wanted to dodge the sniff could
+  // always simply declare application/octet-stream, which has no signature either.
+  const sealed = request.headers.get("x-mushroom-encrypted") === "1";
+  if (!sealed && !(await storedBytesMatchType(env, key, row.content_type))) {
     await env.FILES.delete(key).catch(() => {});
     return fail(415, "type_mismatch");
   }
@@ -678,13 +707,213 @@ async function uploadContent(request, env, auth, id) {
   return reply(200, { url: `${env.PUBLIC_BASE}/f/${row.token}`, expires_at: row.expires_at });
 }
 
-function gonePage(message) {
+/// The page a browser gets for a live link, and the other half of `SporeCrypto` in the Kit.
+///
+/// Since 1.38.0 the Mac seals every file before it leaves, with a key that travels in the
+/// link's fragment. A fragment is never put in a request by any browser, so the key cannot
+/// reach this Worker even in a log; this page is what turns it back into a file. The format
+/// is `"MSH1" || nonce(12) || AES-GCM-256 ciphertext+tag`, and the fixed vector both sides
+/// assert against lives in `vector.mjs` and `SporeCryptoTests.swift`. Changing one is
+/// changing all three.
+///
+/// **Nothing is interpolated into this string.** The page reads the token out of its own
+/// location, so there is no path by which anything a stranger controls reaches the markup.
+/// That is what makes the inline script safe to allow in the CSP; keep it that way, and if
+/// you ever need a server value in here, put it in a `data-` attribute and escape it.
+///
+/// It is served from this origin, which is also where the file bytes come from, so there is
+/// no CORS to arrange and a self-hosted deployment gets this for free. The bytes themselves
+/// are still octet-stream + attachment + nosniff + `default-src 'none'; sandbox`, so nothing
+/// shared can execute here whatever this page does.
+///
+/// The palette is a deliberate third copy of `Mushroom_www/tokens.css` (the second being
+/// `ds/src/styles.css`), because a Worker response cannot link a stylesheet on another
+/// origin. If the tokens change, port them.
+const RECEIVE_PAGE = `<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mushroom</title>
+<style>
+  :root {
+    --bg: #f6ecd8; --card: #fffaf0; --ink: #4a3226; --ink2: #7d6252;
+    --red: #d0342c; --red-ink: #fff; --line: #dcc9a8;
+    --shadow: 0 4px 10px rgba(74,50,38,.09), 0 10px 24px rgba(74,50,38,.11);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17120f; --card: #241b15; --ink: #f3e7d4; --ink2: #b39f8b;
+      --red: #e8524a; --red-ink: #1a0d0b; --line: #3b2d23;
+      --shadow: 0 4px 10px rgba(0,0,0,.4), 0 10px 24px rgba(0,0,0,.44);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font: 16px/1.6 -apple-system, system-ui, sans-serif;
+    background: var(--bg); color: var(--ink);
+    margin: 0; min-height: 100vh;
+    display: flex; align-items: center; justify-content: center; padding: 1.5rem;
+  }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 18px;
+    box-shadow: var(--shadow); padding: 2rem 1.75rem; text-align: center;
+    width: 100%; max-width: 26rem;
+  }
+  .pet { font-size: 3rem; line-height: 1; margin: 0 0 .75rem; }
+  h1 {
+    font-size: 1.1rem; font-weight: 600; margin: 0 0 .35rem;
+    overflow-wrap: anywhere;
+  }
+  p { margin: 0; color: var(--ink2); font-size: .9rem; }
+  button {
+    font: inherit; font-weight: 600; cursor: pointer;
+    margin-top: 1.5rem; padding: .7rem 1.6rem; border: 0; border-radius: 999px;
+    background: var(--red); color: var(--red-ink);
+  }
+  button:disabled { opacity: .6; cursor: default; }
+  button:focus-visible { outline: 2px solid var(--red); outline-offset: 3px; }
+  @media (prefers-reduced-motion: no-preference) { button { transition: opacity .2s; } }
+</style>
+<div class="card">
+  <p class="pet">🍄</p>
+  <h1 id="name">Mushroom</h1>
+  <p id="note">Looking for this file…</p>
+  <button id="go" hidden>Download</button>
+</div>
+<script>
+(function () {
+  var MAGIC = "MSH1";
+  var nameEl = document.getElementById("name");
+  var noteEl = document.getElementById("note");
+  var button = document.getElementById("go");
+  // The key, and the reason this page exists. Read from the fragment and never put into a
+  // request, a header or a URL: that is the whole guarantee.
+  //
+  // Guarded, because a stray % in a mangled link makes decodeURIComponent THROW, and thrown
+  // out here it took the whole script with it: no name, no button, and the page sat on
+  // "Looking for this file…" forever with nothing to explain it. A key we cannot decode is a
+  // key we do not have, which the "missing its key" message below already says properly.
+  var key = "";
+  try { key = decodeURIComponent(location.hash.slice(1)); } catch (e) { key = ""; }
+  var url = location.pathname;
+  var total = 0;
+  var filename = "file";
+  var sealed = false;
+
+  function say(text) { noteEl.textContent = text; }
+
+  function size(bytes) {
+    if (!bytes) return "";
+    var units = ["bytes", "KB", "MB", "GB"];
+    var i = 0;
+    var n = bytes;
+    while (n >= 1024 && i < units.length - 1) { n = n / 1024; i++; }
+    return (i === 0 ? n : n.toFixed(1)) + " " + units[i];
+  }
+
+  // RFC 6266. The UTF-8 form is what the server always sends; the quoted one is the ASCII
+  // fallback beside it.
+  function nameFrom(header) {
+    if (!header) return "file";
+    var star = /filename\\*=UTF-8''([^;]+)/i.exec(header);
+    if (star) { try { return decodeURIComponent(star[1]); } catch (e) { /* fall through */ } }
+    var plain = /filename="([^"]*)"/i.exec(header);
+    return plain ? plain[1] : "file";
+  }
+
+  // One range request tells us everything: the name, the real size, and whether the first
+  // four bytes are ours. Four bytes rather than the whole file, so a link that is missing
+  // its key costs the recipient nothing to find out about.
+  fetch(url, { headers: { "Range": "bytes=0-3" } }).then(function (response) {
+    if (!response.ok && response.status !== 206) throw new Error("gone");
+    filename = nameFrom(response.headers.get("content-disposition"));
+    var range = response.headers.get("content-range");
+    var slash = range ? range.lastIndexOf("/") : -1;
+    total = slash >= 0 ? parseInt(range.slice(slash + 1), 10) : 0;
+    return response.arrayBuffer();
+  }).then(function (head) {
+    sealed = new TextDecoder().decode(head.slice(0, 4)) === MAGIC;
+    nameEl.textContent = filename;
+    if (sealed && !key) {
+      say("This link is missing its key. Ask whoever sent it for the whole link, including everything after the # sign.");
+      return;
+    }
+    say(size(total) + (sealed ? " · Encrypted, only this link can open it" : ""));
+    button.hidden = false;
+  }).catch(function () {
+    nameEl.textContent = "Mushroom";
+    say("That link did not work. It may have expired.");
+  });
+
+  button.addEventListener("click", function () {
+    button.disabled = true;
+    say("Downloading…");
+    fetch(url).then(function (response) {
+      if (!response.ok) throw new Error("gone");
+      var length = parseInt(response.headers.get("content-length") || "0", 10) || total;
+      // Read the stream rather than awaiting the blob, so a 95 MB file shows progress
+      // instead of looking hung.
+      var reader = response.body.getReader();
+      var chunks = [];
+      var done = 0;
+      return (function pump() {
+        return reader.read().then(function (step) {
+          if (step.done) return chunks;
+          chunks.push(step.value);
+          done += step.value.length;
+          if (length) say("Downloading… " + Math.round(done / length * 100) + "%");
+          return pump();
+        });
+      })();
+    }).then(function (chunks) {
+      return new Blob(chunks).arrayBuffer();
+    }).then(function (blob) {
+      if (!sealed) return blob;
+      say("Decrypting…");
+      var raw = new Uint8Array(blob);
+      // MAGIC(4) | nonce(12) | ciphertext+tag. WebCrypto takes the tag on the end of the
+      // ciphertext, which is exactly how CryptoKit's combined form lays it out.
+      var nonce = raw.slice(4, 16);
+      var body = raw.slice(16);
+      var bytes = Uint8Array.from(atob(key.replace(/-/g, "+").replace(/_/g, "/")), function (c) {
+        return c.charCodeAt(0);
+      });
+      return crypto.subtle.importKey("raw", bytes, "AES-GCM", false, ["decrypt"])
+        .then(function (imported) {
+          return crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, imported, body);
+        });
+    }).then(function (plaintext) {
+      var link = document.createElement("a");
+      link.href = URL.createObjectURL(new Blob([plaintext]));
+      link.download = filename;
+      link.click();
+      setTimeout(function () { URL.revokeObjectURL(link.href); }, 60000);
+      say("Saved. It is in your downloads.");
+      button.disabled = false;
+      button.textContent = "Download again";
+    }).catch(function (error) {
+      button.disabled = false;
+      say(sealed && error && error.name === "OperationError"
+        ? "That key does not open this file. Check you copied the whole link."
+        : "That did not finish. Check your connection and try again.");
+    });
+  });
+})();
+</script>
+`;
+
+function gonePage(message, env) {
+  const brand = brandURL(env);
+  // No link at all when this deployment names nobody. `brand` is operator configuration,
+  // never anything a visitor can influence, so it is not escaped; `message` is one of the
+  // two fixed strings below.
+  const footer = brand
+    ? `<p><a href="${brand}">${brand.replace(/^https?:\/\//, "")}</a></p>`
+    : "";
   return new Response(
     `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
     `<title>Mushroom</title><style>body{font:16px/1.6 -apple-system,system-ui,sans-serif;` +
     `max-width:32rem;margin:20vh auto;padding:0 1.5rem;text-align:center;color:#3d3a37}` +
-    `a{color:#c2410c}</style><p style="font-size:3rem">🍄</p><p>${message}</p>` +
-    `<p><a href="https://www.getmushroom.app">getmushroom.app</a></p>`,
+    `a{color:#c2410c}</style><p style="font-size:3rem">🍄</p><p>${message}</p>${footer}`,
     { status: 410, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } }
   );
 }
@@ -695,11 +924,32 @@ async function download(request, env, ctx, token) {
   ).bind(token).first();
 
   if (!row) return new Response("Not found", { status: 404, headers: { "cache-control": "no-store" } });
-  if (row.state === "deleted") return removedPage();
-  if (row.state === "expired" || row.expires_at <= now()) return expiredPage();
+  if (row.state === "deleted") return removedPage(env);
+  if (row.state === "expired" || row.expires_at <= now()) return expiredPage(env);
   // Never finished uploading: indistinguishable from a bad link, and should be.
   if (row.state !== "ready") {
     return new Response("Not found", { status: 404, headers: { "cache-control": "no-store" } });
+  }
+
+  // A browser NAVIGATING here gets the page that can decrypt; everything else (the page's
+  // own fetch, curl, wget, a download manager) sends */* and gets the bytes. One URL, so a
+  // link that has been in circulation for hours keeps working exactly as it did, and the
+  // range support below is untouched.
+  if (request.method === "GET" && (request.headers.get("accept") ?? "").includes("text/html")) {
+    return new Response(RECEIVE_PAGE, {
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store",
+        "referrer-policy": "no-referrer",
+        "x-content-type-options": "nosniff",
+        // 'unsafe-inline' is safe HERE and only here: RECEIVE_PAGE is a constant with no
+        // interpolation, so there is nothing for anyone to inject into. connect-src 'self'
+        // is what stops any of it, key included, being sent anywhere else.
+        "content-security-policy":
+          "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
+          "connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+      },
+    });
   }
 
   const range = request.headers.get("range");
@@ -714,7 +964,7 @@ async function download(request, env, ctx, token) {
       headers: { "content-range": `bytes */${row.size}`, "cache-control": "no-store" },
     });
   }
-  if (!object) return expiredPage();   // lifecycle rule got there first
+  if (!object) return expiredPage(env);   // lifecycle rule got there first
 
   const headers = new Headers();
   // ALWAYS octet-stream, never the declared type. Serving attacker-chosen HTML or SVG
@@ -741,8 +991,11 @@ async function download(request, env, ctx, token) {
   return new Response(request.method === "HEAD" ? null : object.body, { status: 200, headers });
 }
 
-const removedPage = () => gonePage("This file was removed.");
-const expiredPage = () => gonePage("This link has expired. Mushroom links last 24 hours.");
+const removedPage = (env) => gonePage("This file was removed.", env);
+// The lifetime is read from TTL_SECONDS rather than written out, so a self-hoster who
+// shortens it does not end up with a page confidently quoting our number.
+const expiredPage = (env) =>
+  gonePage(`This link has expired. Mushroom links last ${Math.round(TTL_SECONDS / 3600)} hours.`, env);
 
 async function listFiles(env, auth) {
   const blocked = requireLicense(auth);
@@ -798,15 +1051,16 @@ const escapeHTML = (text) => String(text ?? "").replace(/[&<>"']/g, (c) => (
 /// Reports come from a browser on the marketing site, which is the only browser caller
 /// this Worker has. Every response on this route carries the header, including failures,
 /// or the page cannot read its own error.
-function reportCORS(origin) {
-  const allowed = REPORT_ORIGINS.includes(origin) ? origin : REPORT_ORIGINS[1];
+function reportCORS(origin, env) {
+  const origins = reportOrigins(env);
+  const allowed = origins.includes(origin) ? origin : origins[origins.length - 1];
   return { "access-control-allow-origin": allowed, "vary": "Origin" };
 }
 
-function reportReply(status, body, origin) {
+function reportReply(status, body, origin, env) {
   return new Response(JSON.stringify({ ok: status < 400, ...body }), {
     status,
-    headers: { "content-type": "application/json", "cache-control": "no-store", ...reportCORS(origin) },
+    headers: { "content-type": "application/json", "cache-control": "no-store", ...reportCORS(origin, env) },
   });
 }
 
@@ -842,49 +1096,49 @@ async function turnstileOK(token, ip, env) {
   // accepts literally any token anyway so these checks would be the least of it.
   if (outcome.metadata?.result_with_testing_key === true) return true;
 
-  if (outcome.hostname && !REPORT_ORIGINS.includes(`https://${outcome.hostname}`)) return false;
+  if (outcome.hostname && !reportOrigins(env).includes(`https://${outcome.hostname}`)) return false;
   if (outcome.action && outcome.action !== REPORT_ACTION) return false;
   return true;
 }
 
 async function abuseReport(request, env, ctx) {
   const origin = request.headers.get("origin") ?? "";
-  if (!REPORT_ORIGINS.includes(origin)) return reportReply(403, { code: "bad_origin" }, origin);
+  if (!reportOrigins(env).includes(origin)) return reportReply(403, { code: "bad_origin" }, origin, env);
 
   let form;
   try {
     form = await request.formData();
   } catch {
-    return reportReply(400, { code: "bad_request" }, origin);
+    return reportReply(400, { code: "bad_request" }, origin, env);
   }
 
   // Honeypot: look successful, store nothing. Same trick as the tools form.
-  if (form.get("website")) return reportReply(200, { message: REPORT_ACCEPTED }, origin);
+  if (form.get("website")) return reportReply(200, { message: REPORT_ACCEPTED }, origin, env);
 
   if (!(await turnstileOK(form.get("cf-turnstile-response"), request.headers.get("CF-Connecting-IP"), env))) {
-    return reportReply(403, { code: "bot_check", message: "Bot check failed, please reload and try again." }, origin);
+    return reportReply(403, { code: "bot_check", message: "Bot check failed, please reload and try again." }, origin, env);
   }
 
   const shareURL = String(form.get("share_url") ?? "").trim();
   const match = shareURL.match(/^https:\/\/files\.getmushroom\.app\/f\/([A-Za-z0-9_-]{22})$/);
   if (!match) {
-    return reportReply(400, { code: "bad_url", message: "That does not look like a Mushroom share link." }, origin);
+    return reportReply(400, { code: "bad_url", message: "That does not look like a Mushroom share link." }, origin, env);
   }
 
   const reason = String(form.get("reason") ?? "");
-  if (!REPORT_REASONS.includes(reason)) return reportReply(400, { code: "bad_reason" }, origin);
+  if (!REPORT_REASONS.includes(reason)) return reportReply(400, { code: "bad_reason" }, origin, env);
 
   const name = String(form.get("name") ?? "").trim().slice(0, MAX_REPORTER_NAME_CHARS);
   const email = String(form.get("email") ?? "").trim().slice(0, MAX_REPORTER_EMAIL_CHARS);
   const details = String(form.get("details") ?? "").trim().slice(0, MAX_DETAILS_CHARS);
   if (!name || !email.includes("@")) {
-    return reportReply(400, { code: "bad_contact", message: "Please give a name and an email we can reply to." }, origin);
+    return reportReply(400, { code: "bad_contact", message: "Please give a name and an email we can reply to." }, origin, env);
   }
 
   // Everything from here answers identically whether or not the link resolves. A
   // different status, body, or timing-visible branch would make this an oracle for
   // guessing share tokens.
-  const accepted = reportReply(200, { message: REPORT_ACCEPTED }, origin);
+  const accepted = reportReply(200, { message: REPORT_ACCEPTED }, origin, env);
 
   const file = await env.DB.prepare(
     "SELECT id, name, size, content_type, state, device_id, license_hash, created_at, expires_at " +
@@ -1133,7 +1387,11 @@ export default {
     const method = request.method;
 
     if (path === "/" ) {
-      return Response.redirect("https://www.getmushroom.app", 302);
+      const brand = brandURL(env);
+      // A deployment that names nobody says nothing. Sending a self-hoster's visitors to
+      // our marketing site is not this Worker's business.
+      if (!brand) return new Response("Not found", { status: 404, headers: { "cache-control": "no-store" } });
+      return Response.redirect(brand, 302);
     }
 
     // Public download. No auth, that is the whole feature.

@@ -14,6 +14,14 @@
 # is the operator's own folder and may hold anything else.
 set -uo pipefail
 
+# Before anything is created. `sqlite3 .backup` writes 0644 under the default umask, and these
+# databases are not as opaque as "it is all ciphertext anyway" suggests: message bodies are
+# sealed and device tokens are stored as hashes, but `invites.code` is the live invite code in
+# clear and `devices.apns_token` is a real push token. On a box where anyone else has a shell
+# that is a readable copy of both. The `chmod 600` on secrets.env below already says what the
+# intent is; this applies it to the directory and to every database in it.
+umask 077
+
 STATE_ROOT="${STATE_ROOT:-/var/lib/mushroom}"
 DEST="${DEST:-/var/backups/mushroom}"
 KEEP="${KEEP:-3}"

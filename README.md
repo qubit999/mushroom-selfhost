@@ -12,10 +12,19 @@ delete button, and it satisfies most security reviews.
 The app talks to your box and to nothing else. Messages and files never touch our servers, and we
 are not the data processor for either. The servers make no outbound connections.
 
+Your box holds no keys either. Friend messages are sealed on the sending Mac, and since 1.38.0
+every shared file is too: the key travels in the fragment of the share link, after the `#`, which
+no browser ever sends in a request. What your box stores is ciphertext, a filename and a size,
+and the page that turns a link back into a file is served by your box from your own hostname. So
+this deployment is not only free of us in the network path, it is free of us in the trust path,
+and that includes trusting yourself: an operator reading the disk finds nothing to open.
+
 Three things are unavailable on a self-hosted deployment:
 
 - **Background notifications.** Messages wait on your server and arrive when Mushroom is open.
-- **In-app abuse reporting.** Handle misuse through your own policies and the admin commands below.
+- **In-app abuse reporting.** Handle misuse through your own policies and the admin commands
+  below. Note that you cannot inspect a reported file even if you want to, because it is
+  encrypted, so a takedown is a decision about the report rather than about the contents.
 - **Online licence checks.** Not needed here, see Licences.
 
 ## What you need

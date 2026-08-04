@@ -172,6 +172,30 @@ grep -qi 'x-content-type-options: nosniff' <<<"$HEADERS" \
 cmp -s /tmp/mf-body /tmp/mf-test.pdf && ok "bytes round-trip intact" || bad "bytes round-trip" "differ"
 want "range request is 206" 206 "$(status -H 'range: bytes=0-15' "$BASE/f/$STOKEN")"
 
+# ---------------------------------------------------------------- the receive page
+# One URL, two answers. A browser navigating gets the page that can decrypt; the page's own
+# fetch, curl and everything else send */* and get the bytes. Getting this backwards means
+# either recipients download ciphertext they cannot open, or the page fetches itself.
+PAGE=$(curl -s -H 'accept: text/html,application/xhtml+xml' "$BASE/f/$STOKEN")
+grep -q 'crypto.subtle.decrypt' <<<"$PAGE" \
+  && ok "a browser gets the receive page" || bad "a browser gets the receive page" "no decrypt in body"
+PAGE_HEADERS=$(curl -s -D - -o /dev/null -H 'accept: text/html' "$BASE/f/$STOKEN")
+grep -qi 'content-type: text/html' <<<"$PAGE_HEADERS" \
+  && ok "the page is served as html" || bad "the page is served as html" "$(grep -i '^content-type' <<<"$PAGE_HEADERS")"
+grep -qi "connect-src 'self'" <<<"$PAGE_HEADERS" \
+  && ok "the page cannot talk to anywhere else" || bad "connect-src is locked down" "missing"
+curl -s -o /tmp/mf-plain -H 'accept: */*' "$BASE/f/$STOKEN"
+cmp -s /tmp/mf-plain /tmp/mf-test.pdf \
+  && ok "curl still gets the bytes" || bad "curl still gets the bytes" "differ"
+want "HEAD is unaffected by accept" 200 "$(status -I -H 'accept: text/html' "$BASE/f/$STOKEN")"
+
+# The format the page and the Mac have to agree on, byte for byte.
+if node "$(dirname "$0")/vector.mjs" > /tmp/mf-vector 2>&1; then
+  ok "the sealed-file vector matches CryptoKit"
+else
+  bad "the sealed-file vector matches CryptoKit" "$(tail -3 /tmp/mf-vector | tr '\n' ' ')"
+fi
+
 # ---------------------------------------------------------------- magic bytes
 CREATE2=$(curl -s -X POST "${AUTH[@]}" -H 'content-type: application/json' \
   -d '{"name":"fake.png","size":20,"content_type":"image/png"}' "$BASE/v1/files")
@@ -179,6 +203,14 @@ ID2=$(printf '%s' "$CREATE2" | python3 -c 'import json,sys; print(json.load(sys.
 head -c 20 /dev/zero | tr '\0' 'M' > /tmp/mf-fake.png
 want "a non-PNG claiming image/png is 415" 415 \
   "$(status -X PUT "${AUTH[@]}" --data-binary @/tmp/mf-fake.png "$BASE/v1/files/$ID2/content")"
+
+# Sealed bytes match no signature by construction, so the sniff has to stand down for them
+# or every upload from 1.38.0 onwards is refused. Same body, same declared type, one header.
+CREATE2B=$(curl -s -X POST "${AUTH[@]}" -H 'content-type: application/json' \
+  -d '{"name":"sealed.png","size":20,"content_type":"image/png"}' "$BASE/v1/files")
+ID2B=$(printf '%s' "$CREATE2B" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
+want "the same bytes are accepted when sealed" 200 \
+  "$(status -X PUT "${AUTH[@]}" -H 'x-mushroom-encrypted: 1' --data-binary @/tmp/mf-fake.png "$BASE/v1/files/$ID2B/content")"
 
 # ---------------------------------------------------------------- list and delete
 LIST=$(curl -s "${AUTH[@]}" "$BASE/v1/files")

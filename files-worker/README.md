@@ -15,6 +15,7 @@ would shadow a route here.
 | `wrangler.jsonc` | Bindings, cron, custom domain. |
 | `migrations/0001_init.sql` | D1 schema. |
 | `test.sh` | Smoke matrix against `wrangler dev`. |
+| `vector.mjs` | The sealed-file format, asserted against the same fixed vector the Mac uses. Run by `test.sh`. |
 
 ## First-time setup
 

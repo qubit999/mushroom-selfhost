@@ -29,6 +29,20 @@ if [ ! -f "$SECRETS" ]; then
 fi
 . "$SECRETS"
 
+# `${ENROLLMENT_HASHES-*}` below, with ONE dash and not two, and the difference is the whole
+# enrolment posture of the box.
+#
+# Unset still means `*`, which is what .env.example ships and what shared/gumroad.js argues for:
+# the Mac verified the key against Gumroad before it ever reached the Keychain, so a box that
+# cannot reach Gumroad gains nothing by checking a list a human maintains by hand.
+#
+# But an operator who BLANKS the line, which is how somebody says "I have not decided yet" or
+# "nobody", was getting `*` too, because `:-` cannot tell empty from unset. That is the opposite
+# of what `enrolmentAllows` promises for an empty list (a 403, fail closed) and the opposite of
+# what the person typing it meant. gumroad.js says "the container never gets there"; it did, and
+# this is what makes that sentence true. An empty value now reaches the Worker as empty and the
+# box refuses every activation until the operator finishes setting it up.
+
 # The only value with no sensible default. It is baked into every share link the box hands out,
 # so a box that guessed would hand out links to somewhere else. Refusing to start is a much
 # better failure than serving links nobody can open.
@@ -61,7 +75,8 @@ BIND=0.0.0.0 \
 ADMIN_TOKEN="$ADMIN_TOKEN" \
 UNIQUE_KEY="$UNIQUE_KEY" \
 PUBLIC_BASE="$PUBLIC_BASE" \
-ENROLL="${ENROLLMENT_HASHES:-*}" \
+BRAND_URL="${BRAND_URL:-}" \
+ENROLL="${ENROLLMENT_HASHES-*}" \
 TEST_SQL="${SELFHOST_TEST_SQL:-0}" \
   ./dev-config.sh > config.capnp
 

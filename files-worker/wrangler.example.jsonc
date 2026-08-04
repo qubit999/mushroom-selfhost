@@ -37,7 +37,19 @@
     // right app. Public, not a secret: it is the id in every App Store URL, which is why
     // it sits here in version control rather than in a wrangler secret nobody can see.
     "APPSTORE_APP_APPLE_ID": "6792833686",
-    "PUBLIC_BASE": "https://files.getmushroom.app"
+    "PUBLIC_BASE": "https://files.getmushroom.app",
+
+    // Where the expired and removed pages link, and where the bare root redirects. Those two
+    // pages are the only thing this Worker ever shows a person who is not running Mushroom.
+    // Set it to "" and the deployment names nobody: the root answers 404 and the pages carry
+    // no link. Unset falls back to www.getmushroom.app, which is right for us and wrong for
+    // anybody else, so a deployment that is not ours should say something here.
+    "BRAND_URL": "https://www.getmushroom.app",
+
+    // Which origins may post to /v1/abuse-reports, comma separated. Only needed if you serve
+    // your own copy of report.html; unset means our two hostnames. The form also needs
+    // TURNSTILE_SECRET_KEY and an EMAIL binding before it does anything.
+    // "REPORT_ORIGINS": "https://getmushroom.app,https://www.getmushroom.app"
   },
 
   "d1_databases": [

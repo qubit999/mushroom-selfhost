@@ -16,12 +16,16 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 
-const ROOT = process.env.BLOB_ROOT;
 const SOCKET = process.env.BLOB_SOCKET;
-if (!ROOT || !SOCKET) {
+if (!process.env.BLOB_ROOT || !SOCKET) {
   console.error("blobd: set BLOB_ROOT and BLOB_SOCKET");
   process.exit(2);
 }
+// RESOLVED, not taken as typed. The containment check below compares a resolved path against
+// this one, so a BLOB_ROOT with a trailing slash or a relative BLOB_ROOT made every key fail
+// it: the whole store then answered "bad key" to everything, which reads as corruption rather
+// than as a config typo. Our own units set an absolute path, but an operator sets this by hand.
+const ROOT = path.resolve(process.env.BLOB_ROOT);
 
 /// Keys are built by the Worker as `f/<uuid>`, so this should never reject anything real.
 /// It is here because "should never" is not a security boundary: this process turns a string
