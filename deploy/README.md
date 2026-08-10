@@ -124,7 +124,8 @@ servers first, so nothing is left holding a seat.
 Switching is reversible. Credentials are stored per server, so moving to your servers and back
 again returns the Mac to its previous identity with its friendships intact.
 
-This is in the direct download only, not the Mac App Store build.
+This is in both versions. It was direct-download-only until build 111, which put the same pane in
+the Mac App Store build.
 
 ## What does not work, and will not
 

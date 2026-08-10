@@ -39,6 +39,9 @@ dist/
 node_modules/
 .wrangler/
 .wrangler-dev-state/
+# Second local state dir, for running the two Workers side by side (files on 8787,
+# messaging on 8788). One state dir cannot serve both: the D1 binding name is the same.
+.wrangler-dev-state-msg/
 
 # Durable-object state and blobs, if anyone runs a box from inside the checkout.
 do-messaging/

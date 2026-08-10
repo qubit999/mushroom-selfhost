@@ -16,12 +16,17 @@ import m0001 from "../files-worker/migrations/0001_init.sql";
 import m0002 from "../files-worker/migrations/0002_reports.sql";
 import m0003 from "../files-worker/migrations/0003_license_source.sql";
 import m0004 from "../files-worker/migrations/0004_throttle.sql";
+import m0005 from "../files-worker/migrations/0005_entitlement.sql";
 
 const MIGRATIONS = [
   ["0001_init.sql", m0001],
   ["0002_reports.sql", m0002],
   ["0003_license_source.sql", m0003],
   ["0004_throttle.sql", m0004],
+  // Adds `entitled_until`, which every authenticated query now reads. Without this line a
+  // self-hosted box runs the new worker against a table that has no such column and answers
+  // "no such column: entitled_until" to every request, so both features stop outright.
+  ["0005_entitlement.sql", m0005],
 ];
 
 export class SqlStore extends SqlStoreBase {

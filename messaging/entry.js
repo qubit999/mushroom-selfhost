@@ -23,6 +23,7 @@ import m0002 from "../messaging-worker/migrations/0002_identity_license.sql";
 import m0003 from "../messaging-worker/migrations/0003_backfill_identity_license.sql";
 import m0004 from "../messaging-worker/migrations/0004_orphan_identity_cleanup.sql";
 import m0005 from "../messaging-worker/migrations/0005_license_source.sql";
+import m0006 from "../messaging-worker/migrations/0006_entitlement.sql";
 
 const MIGRATIONS = [
   ["0001_init.sql", m0001],
@@ -30,6 +31,10 @@ const MIGRATIONS = [
   ["0003_backfill_identity_license.sql", m0003],
   ["0004_orphan_identity_cleanup.sql", m0004],
   ["0005_license_source.sql", m0005],
+  // Adds `entitled_until`, which every authenticated query now reads. Without this line a
+  // self-hosted box runs the new worker against a table that has no such column and answers
+  // "no such column: entitled_until" to every request, so both features stop outright.
+  ["0006_entitlement.sql", m0006],
 ];
 
 export class SqlStore extends SqlStoreBase {

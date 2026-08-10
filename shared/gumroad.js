@@ -5,17 +5,18 @@
 /// network at all, by design, so the same call has to be answered locally.
 ///
 /// The handoff proposed gating inside `verifyLicense`. That cannot be done without editing the
-/// file Phase B exists to keep unforked: `verifyLicense(key)` takes no `env` in either worker,
+/// file Phase B exists to keep unforked: `verifyLicense` is reached from several layers in either worker,
 /// and it is also reached through `credentialHash` on the channel-migration path. Wrapping the
 /// global `fetch` instead means every byte downstream is the ordinary Gumroad path, including
 /// the `licenses` upsert with its blocked-preserving CASE, the seat cap, `source: "gumroad"`,
 /// and identity claiming. Nothing in worker.js moves.
 ///
-/// An App Store build cannot point at a custom server at all (ServerBase returns nil under
-/// #if APPSTORE), so on-prem is the direct build and therefore Gumroad only. That was a fact
-/// about the CLIENT, read as a property of this server, and it was neither: it is a choice to
+/// An App Store build could not point at a custom server at all (`ServerBase` returned nil under
+/// #if APPSTORE), so on-prem was the direct build and therefore Gumroad only. That was a fact
+/// about the CLIENT, read as a property of this server, and it was neither: it was a choice to
 /// avoid a review conversation, not something Apple forbids, and `/v1/devices/activate` is an
-/// unauthenticated POST either way. Its `app_transaction` branch verifies against the pinned
+/// unauthenticated POST either way. Build 111 removed those guards, so the premise is gone as
+/// well as unsound, and an App Store Mac reaching a self-hosted box is now the ordinary case. Its `app_transaction` branch verifies against the pinned
 /// Apple roots offline, so it never calls `fetch` and never passed through the wrapper below,
 /// and anyone holding an App Store JWS could enrol on a box restricted to named keys.
 ///

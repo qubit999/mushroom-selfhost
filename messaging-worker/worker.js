@@ -13,7 +13,15 @@
 // that identity A sent something to identity B at a time, how big it was, and which Macs
 // were connected. Not the text, not the friend names, not who anybody is.
 
-const GUMROAD_PRODUCT_ID = "59Bhmk7nBsjAqKhst9Bf9g==";  // not a secret; matches LicenseManager.productID
+// Neither is a secret; both match LicenseManager.productIDs. Order matters only for latency:
+// the membership is tried first because new keys are the common case, and a one-time key costs
+// one extra round trip. Old one-time keys must verify FOREVER, which is what the second entry
+// is for and why it can never be removed.
+const GUMROAD_PRODUCT_IDS = [
+  "O8DPu_83HyipF99edOojUQ==",  // Mushroom Membership (subscription)
+  "59Bhmk7nBsjAqKhst9Bf9g==",  // Mushroom macOS app (one-time, pre-subscription)
+];
+
 
 const MAX_MESSAGE_CHARACTERS = 4000;
 // A sealed box is base64 of nonce + ciphertext + tag. Base64 costs 4/3, AES-GCM adds 28
@@ -196,8 +204,21 @@ async function throttle(env, key, bucket, limit, windowSeconds) {
 /// increment_uses_count is FALSE on purpose, same as mushroom-files: the app burns a seat
 /// once at activation, and counting again here would spend the user's seats on our own
 /// bookkeeping.
-async function verifyLicense(key) {
-  const verdict = (status, saleID = null) => ({ status, saleID });
+/// Tries each product in turn and returns the first real answer. "invalid" from the membership
+/// only means "not one of ours from THAT product", so it must fall through to the one-time
+/// product rather than being reported; anything else (active, lapsed, revoked, unreachable) is a
+/// real answer about this key and stops the loop. If every product says invalid, it is invalid.
+async function verifyLicense(key, env) {
+  let last = { status: "invalid", saleID: null, entitledUntil: null };
+  for (const productID of GUMROAD_PRODUCT_IDS) {
+    last = await verifyLicenseAgainst(key, productID, env);
+    if (last.status !== "invalid") return last;
+  }
+  return last;
+}
+
+async function verifyLicenseAgainst(key, productID, env) {
+  const verdict = (status, saleID = null, entitledUntil = null) => ({ status, saleID, entitledUntil });
 
   let response;
   try {
@@ -205,7 +226,7 @@ async function verifyLicense(key) {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
-        product_id: GUMROAD_PRODUCT_ID,
+        product_id: productID,
         license_key: key,
         increment_uses_count: "false",
       }),
@@ -226,7 +247,50 @@ async function verifyLicense(key) {
 
   const purchase = body.purchase ?? {};
   if (purchase.refunded || purchase.disputed || purchase.chargebacked) return verdict("revoked");
-  return verdict("active", typeof purchase.sale_id === "string" ? purchase.sale_id : null);
+
+  const saleID = typeof purchase.sale_id === "string" ? purchase.sale_id : null;
+
+  // ENTITLEMENT, and the rule is the absence of a field rather than a date.
+  //
+  // A one-time purchase carries no `subscription_id`; a membership always does. Both shapes were
+  // captured from the live API on 2026-08-08 and are pinned as tests in
+  // Tests/MushroomPetKitTests/KitTests.swift. So "no subscription_id" means "not a membership",
+  // which is necessary but NOT sufficient: the one-time product is still on sale, so the branch
+  // below still has to date it against the cutover. Do not collapse the two.
+  //
+  // That also grandfathers a self-hosted box for free: `installOfflineGumroad` synthesises a
+  // purchase with no subscription_id, so an air-gapped install entitles itself and needs no
+  // ENTITLEMENT_CUTOVER. Deliberate, not a coincidence.
+  if (typeof purchase.subscription_id !== "string") {
+    // A one-time purchase. Entitled forever ONLY if it predates the cutover.
+    //
+    // "No subscription_id" alone is not enough, and believing it was would have been a revenue
+    // hole with the shape of a feature: the one-time product is STILL ON SALE, so anyone could
+    // buy the app once and get Friends permanently for less than four months of
+    // membership. The one-time product's own Gumroad listing says so ("File sharing and Friends
+    // stay off in that version"), so this is what makes the code agree with what buyers are told.
+    //
+    // Same cutover, same 0-means-grandfather-everyone default, and therefore the same no-op
+    // deploy as the App Store path. An unparseable or missing date counts as pre-cutover, for
+    // the same asymmetry: wrongly refusing an old buyer breaks something they paid for, wrongly
+    // admitting one costs us a little hosting.
+    const cutover = Number(env.ENTITLEMENT_CUTOVER ?? 0);
+    if (!Number.isFinite(cutover) || cutover <= 0) return verdict("active", saleID, null);
+    const soldMs = Date.parse(purchase.sale_timestamp ?? purchase.created_at ?? "");
+    if (!Number.isFinite(soldMs)) return verdict("active", saleID, null);
+    return Math.floor(soldMs / 1000) < cutover
+      ? verdict("active", saleID, null)
+      : verdict("lapsed", saleID);
+  }
+
+  // A membership. `subscription_cancelled_at` is deliberately NOT consulted: Gumroad sets it the
+  // moment somebody cancels while the membership still runs to the end of the paid period, and
+  // `subscription_ended_at` is what appears when it actually stops. Treating cancelled as lapsed
+  // would take away time they have already paid for.
+  if (purchase.subscription_ended_at || purchase.subscription_failed_at) {
+    return verdict("lapsed", saleID);
+  }
+  return verdict("active", saleID, now() + LICENSE_RECHECK_SECONDS);
 }
 
 // ---------------------------------------------------------------- app store purchases
@@ -239,6 +303,12 @@ async function verifyLicense(key) {
 // The trust anchors live in ONE place, ../worker-shared/apple-roots.js, imported by both
 // workers: they must be rotated in lockstep and nothing here would catch a one-sided edit.
 import { APPSTORE_BUNDLE_ID, APPLE_ROOT_CA_G3, APPLE_ROOT_CA_G2 } from "../worker-shared/apple-roots.js";
+// The entitlement RULES live next to them, for the same reason and with the same hazard: the
+// two workers gate different features on one membership, so a rule that differs by a character
+// between them means a subscriber keeps one and loses the other.
+import { LICENSE_RECHECK_SECONDS, appStoreEntitlement, verifyAppSubscription,
+         entitlementMisconfigured }
+  from "../worker-shared/entitlement.js";
 
 // The JWS is three base64url segments and a signature; a real one is a few KB. Bounded so a
 // megabyte of junk cannot reach the verifier.
@@ -249,6 +319,39 @@ const MAX_APP_TRANSACTION_CHARS = 12000;
 // group member, so a Family Sharing member gets their own three seats rather than fighting
 // over the purchaser's.
 const appStoreHash = (appTransactionID) => sha256Hex(`appstore:${appTransactionID}`);
+
+/// How many Macs THIS licence row may keep, counted across every row that shares the sale.
+///
+/// One membership sale means three Macs IN TOTAL, not three per row, and rows multiply because a
+/// redeeming App Store account gets its own row keyed on its own app transaction while a
+/// direct-build Mac hashes the key itself. Applying this to the redeem branch alone bounded the
+/// redeemers against each other and then handed the ordinary Gumroad branch a full fresh three on
+/// top, so one 3-Mac sale kept six Macs here and six more on mushroom-files. Nothing else bounded
+/// it: `verifyLicenseAgainst` sends `increment_uses_count: "false"`, so neither Worker ever spends
+/// a Gumroad seat to find out.
+///
+/// Counted in MACS, not in rows. Counting rows capped the number of Apple Accounts while each of
+/// those rows went on to keep its own three devices under the eviction, and it made the client's
+/// sentence ("already set up on three Macs") name a unit nothing was counting.
+///
+/// Excludes this hash so re-activating a Mac that is already counted stays free. A response with no
+/// sale id cannot be counted, so it is let through rather than refused (§12 fail-open); the live API
+/// always sends one. Returns null when the sale's seats are already spent, which the caller answers
+/// with `seat_limit` and NEVER `subscription_required`: that code is the one both clients treat as a
+/// final entitlement refusal and persist.
+///
+/// Same rule, same reasoning, as mushroom-files' copy. Both Workers have to agree or a subscriber
+/// gets a different number of Macs for Friends than for Spore Storage.
+async function saleSeatBudget(env, saleID, hash) {
+  if (!saleID) return MAX_DEVICES_PER_LICENSE;
+  const seats = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM devices d " +
+    "JOIN licenses l ON l.license_hash = d.license_hash " +
+    "WHERE l.gumroad_sale_id = ? AND l.license_hash != ? AND d.revoked_at IS NULL"
+  ).bind(saleID, hash).first();
+  const taken = seats?.n ?? 0;
+  return taken >= MAX_DEVICES_PER_LICENSE ? null : MAX_DEVICES_PER_LICENSE - taken;
+}
 
 /// May a credential that verified as this hash enrol on THIS box?
 ///
@@ -313,14 +416,21 @@ async function appStoreVerifiers(appAppleID) {
 }
 
 /// Verify an AppTransaction JWS.
-/// Returns `{ status, appTransactionID }` where status is
+/// Returns `{ status, appTransactionID, originalPurchaseMs }` where status is
 /// "active" | "invalid" | "unconfigured".
+///
+/// `originalPurchaseMs` is when this Apple Account FIRST bought the app, in ms since epoch, and
+/// it is what grandfathers an App Store buyer from before the subscription existed. Preferred
+/// over `originalApplicationVersion`, which on macOS is a build-number string and would need a
+/// parser. Optional in Apple's model, so it can be null, and a null must never be read as
+/// "bought recently": see the cutover comparison in activateDevice.
 ///
 /// There is deliberately no "unreachable": the JWS carries its own certificate chain and is
 /// checked against a pinned root, so unlike the Gumroad path there is no third party who can
 /// be down. "unconfigured" is our own missing app id, not the user's problem.
 async function verifyAppTransaction(jws, env) {
-  const verdict = (status, appTransactionID = null) => ({ status, appTransactionID });
+  const verdict = (status, appTransactionID = null, originalPurchaseMs = null) =>
+    ({ status, appTransactionID, originalPurchaseMs });
 
   // Shape first, crypto second. Verification is the expensive part of this endpoint, and it
   // is unauthenticated by nature, so anything obviously not a JWS is rejected before it can
@@ -349,7 +459,8 @@ async function verifyAppTransaction(jws, env) {
       // we actually need, and it is optional in the model, so an answer without one is no
       // use to us as an identity.
       if (typeof tx.appTransactionId === "string" && tx.appTransactionId) {
-        return verdict("active", tx.appTransactionId);
+        const bought = typeof tx.originalPurchaseDate === "number" ? tx.originalPurchaseDate : null;
+        return verdict("active", tx.appTransactionId, bought);
       }
       failures.push("no_app_transaction_id");
     } catch (error) {
@@ -384,8 +495,15 @@ async function credentialHash(env, { key, jws }) {
     return status === "active" ? await appStoreHash(appTransactionID) : null;
   }
   if (key) {
-    const { status } = await verifyLicense(key);
-    return (status === "active" || status === "revoked") ? await licenseHash(key) : null;
+    const { status } = await verifyLicense(key, env);
+    // "lapsed" counts, for the same reason "revoked" does, and leaving it out was a real bug:
+    // a membership that stopped paying is still proof the holder owned that licence, which is
+    // the standard the original claim was made to. The case this exists for is precisely a
+    // lapsed one, because the ONLY reason to migrate off a Gumroad key is that it stopped
+    // working. Refusing it here stranded the identity on a dead licence forever, with nothing
+    // but Start Over (which deletes every friendship) as a way out.
+    return (status === "active" || status === "revoked" || status === "lapsed")
+      ? await licenseHash(key) : null;
   }
   return null;
 }
@@ -452,10 +570,10 @@ async function migrateIdentity(env, identityID, oldHash, newHash, body, stamp) {
 
 // ---------------------------------------------------------------- auth
 
-async function authenticate(request, env, ctx) {
+async function authenticate(request, env, ctx, opts) {
   const header = request.headers.get("authorization") ?? "";
   if (!header.startsWith("Bearer ")) return null;
-  return authenticateToken(header.slice(7).trim(), env, ctx);
+  return authenticateToken(header.slice(7).trim(), env, ctx, opts);
 }
 
 /// Split out for the WebSocket upgrade, which reaches the token a second way.
@@ -465,17 +583,34 @@ async function authenticate(request, env, ctx) {
 /// in Workers Logs, and a token in the query string is a live, never-expiring credential
 /// written into a searchable index. The `?token=` fallback below exists only for builds that
 /// shipped before the header, and should be dropped once none are left.
-async function authenticateToken(token, env, ctx) {
+/// `allowExpired` drops ONLY the entitlement clause, never the device, revocation or
+/// license-status checks.
+///
+/// It exists for `releaseDevice`: releasing your own Mac is cleanup, not access, and the
+/// entitlement clause landed in front of every /v1/ route, so a lapsed member got 401 on the one
+/// call that hands their seat back. The seat then stayed occupied until LRU eviction, which turns
+/// the seat cap into a trap. Same exemption, same reasoning, as files-worker's `authenticate`.
+async function authenticateToken(token, env, ctx, { allowExpired = false } = {}) {
   if (!token) return null;
   const tokenHash = await sha256Hex(token);
 
   // One round trip, not two: an INNER JOIN gives the same answer as the two lookups it
   // replaces (no row when the device is revoked, no row when the license is missing).
+  //
+  // The entitlement clause is what makes a subscription actually recur, and it reuses machinery
+  // that already exists rather than adding a timer. An expired row yields no auth row, which is
+  // already `return null`, which is already a 401, which the client already handles by deleting
+  // its token and re-activating (MessagingService.swift, the .reactivate branch). Re-activation
+  // is a real Gumroad or Apple call, so it either extends the horizon or answers 403
+  // subscription_required. Nothing polls, and nothing had to be built to make it recur.
+  //
+  // NULL passes forever: `entitled_until IS NULL` is the grandfathered case.
   const row = await env.DB.prepare(
     "SELECT d.id AS device_id, d.identity_id, d.license_hash, l.status " +
     "FROM devices d JOIN licenses l ON l.license_hash = d.license_hash " +
-    "WHERE d.token_hash = ? AND d.revoked_at IS NULL"
-  ).bind(tokenHash).first();
+    "WHERE d.token_hash = ? AND d.revoked_at IS NULL " +
+    (allowExpired ? "" : "AND (l.entitled_until IS NULL OR l.entitled_until > ?)")
+  ).bind(...(allowExpired ? [tokenHash] : [tokenHash, now()])).first();
   if (!row) return null;
   // A blocked license keeps its token but loses the service. Distinct from revoked, which
   // is Gumroad's word (refund, chargeback); blocked is ours (abuse).
@@ -504,28 +639,106 @@ async function activateDevice(request, env) {
   // an App Store build ends up authenticating as somebody else's Gumroad licence.
   const key = typeof body.license_key === "string" ? body.license_key.trim() : "";
   const jws = typeof body.app_transaction === "string" ? body.app_transaction.trim() : "";
+  // An entitlement proof, NOT a credential: deliberately absent from the "exactly one credential"
+  // check below, exactly like migrate_app_transaction. It never decides identity, only how long.
+  const subJWS = typeof body.app_subscription === "string" ? body.app_subscription.trim() : "";
+  // A Gumroad membership key entered in the App Store build under "Already subscribed
+  // elsewhere?". Also an entitlement proof and NEVER a credential: it is deliberately not part of
+  // the one-credential check, and `hash` is never derived from it. Deriving identity from it
+  // would drag every redeeming Mac through the migration path on every activation and move its
+  // friendships to a different licence.
+  const redeemKey = typeof body.redeem_license_key === "string" ? body.redeem_license_key.trim() : "";
   if (!key === !jws) return fail(400, "bad_request");
   if (key && key.length > 100) return fail(400, "bad_request");
   if (jws && jws.length > MAX_APP_TRANSACTION_CHARS) return fail(400, "bad_request");
+  if (subJWS && subJWS.length > MAX_APP_TRANSACTION_CHARS) return fail(400, "bad_request");
+  if (redeemKey && redeemKey.length > 100) return fail(400, "bad_request");
   if (!isPublicKey(body.public_key)) return fail(400, "bad_public_key");
 
   const stamp = now();
   let hash;
   let saleID = null;
   let source;
+  // NULL means entitled forever, and it is the default for a reason: every path that does not
+  // deliberately set a horizon is a grandfathered one.
+  let entitledUntil = null;
+  // How many Macs THIS row may keep once it is written. BOTH credential branches lower it, so
+  // that one membership sale means three Macs in total rather than three per Apple Account:
+  // see `saleSeatBudget` and the eviction that spends this budget.
+  let deviceBudget = MAX_DEVICES_PER_LICENSE;
+
+  // BEFORE either credential branch, because the hazard is what gets WRITTEN below rather than
+  // which door it came through. Both entitlement rules answer NULL when the cutover is missing,
+  // and NULL on a row that does not exist yet is permanent: the INSERT writes it and the upsert's
+  // first CASE clause then pins it. Fails soft with 503 rather than minting that. See
+  // `entitlementMisconfigured`; a self-hoster sets neither var and never reaches it.
+  if (entitlementMisconfigured(env)) return fail(503, "appstore_unconfigured");
 
   if (jws) {
-    const { status, appTransactionID } = await verifyAppTransaction(jws, env);
+    const { status, appTransactionID, originalPurchaseMs } = await verifyAppTransaction(jws, env);
     if (status === "unconfigured") return fail(503, "appstore_unconfigured");
     if (status !== "active") return fail(403, "bad_license");
     hash = await appStoreHash(appTransactionID);
     source = "appstore";
+    entitledUntil = appStoreEntitlement(originalPurchaseMs, env);
+    // "lapsed" here only means "bought after the cutover", which is not yet a refusal: a live
+    // subscription is the other way to be entitled. Grandfathered buyers never reach this at all,
+    // which is why a missing subscription is not an error for them.
+    if (entitledUntil === "lapsed") {
+      const sub = subJWS
+        // `appStoreVerifiers` is passed in: it does a bare dynamic import of
+        // @apple/app-store-server-library, which is declared in THIS worker's package.json, so it
+        // has to stay on this side of the shared module. See worker-shared/entitlement.js.
+        ? await verifyAppSubscription(subJWS, env, appTransactionID, appStoreVerifiers)
+        : { status: "invalid", entitledUntil: null };
+      if (sub.status !== "active") {
+        // No StoreKit subscription. A membership bought on the website is the other way to be
+        // entitled (guideline 3.1.3(b), permitted because the same membership is also an in-app
+        // purchase). Verified with the ORDINARY Gumroad path and the ordinary entitlement rule,
+        // and used ONLY for the horizon.
+        const redeemed = redeemKey ? await verifyLicense(redeemKey, env) : { status: "unset" };
+        // "unreachable" is Gumroad being down, NOT this person being unentitled. The primary
+        // Gumroad branch below says "FAIL CLOSED here, and only here" and answers 503; collapsing
+        // it into a 403 here made a third-party rate limit revoke a paid feature, which the
+        // client then LATCHES (markNotEntitled / markNoServerFeatures). §12 forbids exactly that.
+        if (redeemed.status === "unreachable") return fail(503, "gumroad_down");
+        // A MEMBERSHIP, not any old key. `verifyLicense` tries both products, so without this a
+        // one-time $9.99 key returned `active` with a null horizon, which the upsert's
+        // once-forever CASE then pinned as permanent and irreversible, on unlimited App Store
+        // accounts, with no seat spent (increment_uses_count is false on this path). A null
+        // horizon here means "not a membership" and must be refused.
+        if (redeemed.status !== "active" || redeemed.entitledUntil === null) {
+          // Only NOW is the missing product-id config fatal: an unconfigured deployment must not
+          // preempt a perfectly good website membership.
+          if (sub.status === "unconfigured") return fail(503, "appstore_unconfigured");
+          return fail(403, "subscription_required");
+        }
+        // SEAT CAP, the same three the licence is sold with. NOTHING else bounded this path:
+        // it spends no Gumroad seat (`increment_uses_count` is false here) and every Apple
+        // Account gets its own `licenses` row keyed on its own app transaction, so one key
+        // posted publicly entitled an unbounded number of accounts, each with its own three
+        // devices.
+        //
+        // See `saleSeatBudget`, which the ordinary Gumroad branch below now shares: capping only
+        // here bounded the redeemers against each other and then let the same sale take a full
+        // fresh three through the other door.
+        const budget = await saleSeatBudget(env, redeemed.saleID, hash);
+        if (budget === null) return fail(403, "seat_limit");
+        deviceBudget = budget;
+        entitledUntil = redeemed.entitledUntil;
+        // Recorded so the NEXT redeemer is counted against this sale. Without it every row
+        // stayed anonymous and the cap above could never see anybody.
+        saleID = redeemed.saleID;
+      } else {
+        entitledUntil = sub.entitledUntil;
+      }
+    }
     // No revoked branch: an Apple refund is not visible from here. Catching one needs App
     // Store Server Notifications V2 and a webhook, and §14 says fail open and do not build
     // DRM until piracy is a real problem. `blocked` below still works, because that is our
     // own abuse decision and applies to either channel.
   } else {
-    const { status: verdict, saleID: gumroadSaleID } = await verifyLicense(key);
+    const { status: verdict, saleID: gumroadSaleID, entitledUntil: until } = await verifyLicense(key, env);
     // FAIL CLOSED here, and only here. The app's own license gate fails OPEN by design
     // (CLAUDE.md §12: never lock a paying user out for being offline) and an already issued
     // token keeps working while Gumroad is down. But handing out a NEW token without checking
@@ -536,6 +749,12 @@ async function activateDevice(request, env) {
     hash = await licenseHash(key);
     saleID = gumroadSaleID;
     source = "gumroad";
+    entitledUntil = until;
+
+    // A real key whose membership has stopped. Distinct from "revoked" on purpose: nothing was
+    // refunded and nothing is being punished, so the row keeps its status and the app keeps its
+    // key. Paying again makes the very next activation succeed with nothing to re-enter.
+    if (verdict === "lapsed") return fail(403, "subscription_required");
 
     if (verdict === "revoked") {
       await env.DB.prepare(
@@ -551,6 +770,16 @@ async function activateDevice(request, env) {
       ).bind(hash, stamp, stamp).run();
       return fail(403, "revoked");
     }
+
+    // The SAME cap the redeem branch applies, and the reason it is a shared helper. This branch
+    // used to keep a full `MAX_DEVICES_PER_LICENSE` of its own on top of whatever the redeemers
+    // had already taken from the same sale, because the eviction below is scoped to
+    // `license_hash` alone and a direct-build Mac hashes the key while a redeeming Apple Account
+    // hashes its app transaction. One 3-Mac sale therefore kept six Macs. Placed after the
+    // revoked branch so a refused key never spends a query.
+    const budget = await saleSeatBudget(env, saleID, hash);
+    if (budget === null) return fail(403, "seat_limit");
+    deviceBudget = budget;
   }
 
   // BOTH branches, on the hash whichever one produced, and BEFORE the upsert below so a refused
@@ -560,14 +789,37 @@ async function activateDevice(request, env) {
 
   // Never downgrade a BLOCKED license back to active on re-activation: blocked is our
   // decision about abuse, and neither Gumroad nor Apple has an opinion on it.
+  //
+  // ONCE FOREVER, ALWAYS FOREVER, and now MONOTONIC IN BOTH DIRECTIONS: a NULL `entitled_until`
+  // can never be replaced by a horizon, and a horizon can never be replaced by NULL either. Only
+  // horizon -> horizon moves, which is what a renewal is.
+  //
+  // The second clause is the newer half. Permitting horizon -> NULL made an ordinary config slip
+  // irreversible: `appStoreEntitlement()` answers NULL whenever ENTITLEMENT_CUTOVER is absent, 0
+  // or unparseable, and `vars` are replaced wholesale on every `wrangler deploy`, so one deploy
+  // from a config missing the var (it ships commented out) silently promoted every subscriber who
+  // activated during that window to permanent, with the first clause then locking them there.
+  // Nothing in a later deploy could undo it; hand-written SQL against production was the only
+  // recovery. Deliberately grandfathering an existing horizon row is now that same manual act,
+  // which is the right price for making the accident impossible.
+  //
+  // The first clause is what makes grandfathering irreversible: it holds even if a later build
+  // computes the wrong horizon, even if someone flips the cutover by mistake, and even if Gumroad
+  // transiently omits `subscription_id`. Every row that existed when the migration ran is NULL,
+  // so every user who had ever activated is grandfathered with no backfill and no date
+  // arithmetic at all.
   await env.DB.prepare(
-    "INSERT INTO licenses (license_hash, status, checked_at, created_at, gumroad_sale_id, source) " +
-    "VALUES (?, 'active', ?, ?, ?, ?) " +
+    "INSERT INTO licenses (license_hash, status, checked_at, created_at, gumroad_sale_id, source, entitled_until) " +
+    "VALUES (?, 'active', ?, ?, ?, ?, ?) " +
     "ON CONFLICT(license_hash) DO UPDATE SET " +
     "status = CASE WHEN licenses.status = 'blocked' THEN 'blocked' ELSE 'active' END, " +
     "checked_at = excluded.checked_at, " +
-    "gumroad_sale_id = COALESCE(excluded.gumroad_sale_id, licenses.gumroad_sale_id)"
-  ).bind(hash, stamp, stamp, saleID, source).run();
+    "gumroad_sale_id = COALESCE(excluded.gumroad_sale_id, licenses.gumroad_sale_id), " +
+    "entitled_until = CASE " +
+    "WHEN licenses.entitled_until IS NULL THEN NULL " +
+    "WHEN excluded.entitled_until IS NULL THEN licenses.entitled_until " +
+    "ELSE excluded.entitled_until END"
+  ).bind(hash, stamp, stamp, saleID, source, entitledUntil).run();
 
   const blocked = await env.DB.prepare("SELECT status FROM licenses WHERE license_hash = ?")
     .bind(hash).first();
@@ -612,6 +864,30 @@ async function activateDevice(request, env) {
     "ON CONFLICT(id) DO UPDATE SET license_hash = COALESCE(identities.license_hash, excluded.license_hash)"
   ).bind(identityID, body.public_key, hash, stamp).run();
 
+  // THIS Mac's own previous row goes first, and that is what makes a re-activation a reclaim
+  // rather than a second seat. The client sends the device id it already holds, so the row it is
+  // replacing is identifiable; without it the caller's stale row was indistinguishable from
+  // another Mac's, the eviction below counted it as live, and a three-Mac licence lost a healthy
+  // Mac every time one of them re-activated. Routine now rather than rare, because the
+  // entitlement horizon expires every LICENSE_RECHECK_SECONDS and 401s until the Mac re-activates.
+  //
+  // Scoped to THIS licence hash, so a device id lifted from somewhere else cannot revoke another
+  // licence's Mac. Out of the INBOX as well as D1, for the same reason the eviction below does it:
+  // a row left there holds this Mac's still-valid APNs token with a frozen `last_acked_seq` and
+  // goes on being pushed at under an id the Mac no longer uses.
+  const priorID = typeof body.device_id === "string" ? body.device_id.slice(0, 64) : null;
+  if (priorID) {
+    const prior = await env.DB.prepare(
+      "SELECT identity_id FROM devices WHERE id = ? AND license_hash = ? AND revoked_at IS NULL"
+    ).bind(priorID, hash).first();
+    if (prior) {
+      await env.DB.prepare("UPDATE devices SET revoked_at = ? WHERE id = ?")
+        .bind(stamp, priorID).run();
+      await inboxCall(env, prior.identity_id, "/devices/remove", { device: priorID })
+        .catch(() => {});
+    }
+  }
+
   // Past the cap, evict the least-recently-seen Mac rather than refusing. A 409 would
   // strand someone who reinstalled twice, and the evicted Mac silently re-activates on its
   // next 401. Scoped to the license, not the identity: three Macs, however many keys.
@@ -619,7 +895,7 @@ async function activateDevice(request, env) {
     "SELECT id, identity_id FROM devices WHERE license_hash = ? AND revoked_at IS NULL " +
     "ORDER BY last_seen_at DESC"
   ).bind(hash).all();
-  for (const device of (live.results ?? []).slice(MAX_DEVICES_PER_LICENSE - 1)) {
+  for (const device of (live.results ?? []).slice(deviceBudget - 1)) {
     await env.DB.prepare("UPDATE devices SET revoked_at = ? WHERE id = ?")
       .bind(stamp, device.id).run();
     // And out of the INBOX, which is where `alarm()` looks. Revoking in D1 alone left a row
@@ -1106,11 +1382,15 @@ export class UserInbox {
   async deliver({ msg_id: msgID, from, ciphertext, sent_at: sentAt }) {
     if (!msgID || !from || !ciphertext) return fail(400, "bad_request");
 
+    // The same exception `handleSend` makes, and it has to be made here too: this is the route
+    // that route calls, and one Mac writing to the identity's own inbox is how the user's other
+    // Macs learn what was sent, what people are called and what has been read.
+    const mine = from === this.identity();
     const friend = this.friend(from);
     // Both answers are 403 and both name their reason, because the SENDER is not told
     // these apart: the app maps `blocked` to the same sentence as `not_friends`.
-    if (!friend) return fail(403, "not_friends");
-    if (friend.blocked) return fail(403, "blocked");
+    if (!mine && !friend) return fail(403, "not_friends");
+    if (!mine && friend.blocked) return fail(403, "blocked");
 
     const stamp = now();
     // Retention runs HERE rather than on a cron. A cron would have to enumerate every
@@ -1151,7 +1431,12 @@ export class UserInbox {
     //
     // Unless there is no push to arm. `alarm()` does nothing else, so on a deployment without
     // an APNs key this would wake the inbox once per message to discover that again.
-    if (apnsConfigured(this.env)) {
+    //
+    // And never for one of the user's OWN messages. It is not news, and the notification says a
+    // friend wrote: a Mac asleep in another room would announce a message its owner had just
+    // typed on the Mac in front of them, once per message, forever. Nothing is lost by leaving
+    // it, since these are picked up on the next connect like any other catch-up.
+    if (apnsConfigured(this.env) && !mine) {
       // ONLY when no alarm is already pending, and that guard is doing two jobs.
       //
       // It stops a busy conversation resetting the retry budget. Clearing the counter on every
@@ -1233,13 +1518,17 @@ export class UserInbox {
     return reply(200, {});
   }
 
-  removeDevice(device) {
+  async removeDevice(device) {
     if (!device) return fail(400, "bad_request");
     this.sql.exec("DELETE FROM devices WHERE device_id = ?", device);
     // And the SOCKET, which the row deletion on its own left wide open: eviction and "Start
     // Over" both come through here, and a connection that keeps sending and acking after the
     // device it belongs to has been removed is the revocation not happening.
     this.dropSockets(device);
+    // And the recheck stamp, which nothing else ever deletes. It is one key per device that has
+    // ever connected, kept forever, and a stale one would also hand a re-added device id up to
+    // SOCKET_RECHECK_SECONDS of unchecked frames.
+    await this.ctx.storage.delete(`checked:${device}`);
     return reply(200, {});
   }
 
@@ -1301,10 +1590,24 @@ export class UserInbox {
       return;   // Never close the socket over one genuinely bad frame.
     }
 
+    // `stillAuthorized` guards EVERY frame that does something, not only the heartbeat. It was
+    // reachable from `ping` alone, so a lapsed subscriber (or a revoked device, or a blocked
+    // licence) whose client simply stopped pinging kept sending, acking and typing for as long
+    // as the socket stayed up, while every HTTP route correctly 401'd. `entitlement-socket.mjs`
+    // only ever sends `ping`, so the test suite reported that as covered.
+    //
+    // It costs nothing per message: the check is throttled to SOCKET_RECHECK_SECONDS and returns
+    // true out of DO storage without touching D1 in between.
     switch (frame.t) {
-      case "send": return this.handleSend(socket, frame);
-      case "ack": return this.handleAck(socket, frame);
-      case "typing": return this.handleTyping(frame);
+      case "send":
+        if (!(await this.stillAuthorized(socket))) return;
+        return this.handleSend(socket, frame);
+      case "ack":
+        if (!(await this.stillAuthorized(socket))) return;
+        return this.handleAck(socket, frame);
+      case "typing":
+        if (!(await this.stillAuthorized(socket))) return;
+        return this.handleTyping(frame);
       case "ping":
         // Still allowed to be here? Throttled, and BEFORE the pong, so a socket whose device
         // was revoked or whose license was blocked is closed rather than reassured.
@@ -1338,7 +1641,13 @@ export class UserInbox {
         code: "bad_request",
       }));
     }
-    if (!this.friend(peerID)) {
+    // OURSELVES is allowed, and it is the only exception. One identity can be activated on
+    // several Macs, and the app uses a message addressed to its own inbox to tell those Macs
+    // three things the server does not hold: what was sent (our outbox never becomes a stored
+    // row anywhere, so a second Mac would see only the friend's half of every conversation),
+    // what the user calls people, and how far they have read. Sealed like any other message, so
+    // this side still learns nothing from it.
+    if (peerID !== this.identity() && !this.friend(peerID)) {
       return socket.send(JSON.stringify({ t: "rejected", msg_id: msgID, code: "not_friends" }));
     }
     if (!(await this.allow("send", MESSAGES_PER_MINUTE, 60))) {
@@ -1358,9 +1667,17 @@ export class UserInbox {
     let response;
     let seq;
     try {
-      response = await inboxCall(this.env, peerID, "/deliver", {
+      const payload = {
         msg_id: msgID, from: this.identity(), ciphertext, sent_at: frame.sent_at,
-      });
+      };
+      // DIRECT for our own inbox, rather than a fetch to ourselves. `inboxCall` would resolve
+      // the stub for this very object and re-enter it from inside `webSocketMessage`, and
+      // whether the runtime delivers that event while we sit awaiting it is a detail of input
+      // gates that is nowhere in the contract. Calling the method is the same work with none of
+      // the question, and it is faster: the message never leaves the object.
+      response = peerID === this.identity()
+        ? await this.deliver(payload)
+        : await inboxCall(this.env, peerID, "/deliver", payload);
       if (!response.ok) {
         const body = await response.json().catch(() => ({}));
         // `blocked` is deliberately reported as `not_friends`: telling someone they have been
@@ -1445,20 +1762,52 @@ export class UserInbox {
     const key = `checked:${device}`;
     const last = (await this.ctx.storage.get(key)) ?? 0;
     if (now() - last < SOCKET_RECHECK_SECONDS) return true;
-    await this.ctx.storage.put(key, now());
 
     let row;
     try {
       row = await this.env.DB.prepare(
         "SELECT l.status FROM devices d JOIN licenses l ON l.license_hash = d.license_hash " +
-        "WHERE d.id = ? AND d.revoked_at IS NULL"
-      ).bind(device).first();
+        // The SAME entitlement clause as `authenticate` and `authenticateToken`. Missing it here
+        // was the one hole in the whole mechanism: this socket is hibernation-backed and outlives
+        // the process that authenticated it, and it is where messages, acks, typing and presence
+        // actually flow. Without the clause a lapsed subscriber who simply never quit the app
+        // kept Friends working indefinitely, while every HTTP route correctly 401'd.
+        "WHERE d.id = ? AND d.revoked_at IS NULL " +
+        "AND (l.entitled_until IS NULL OR l.entitled_until > ?)"
+      ).bind(device, now()).first();
     } catch {
-      return true;   // fail open, see above
+      // Fail open, see above, and WITHOUT refreshing the stamp. Stamping before the query meant
+      // one blipped D1 call both failed open and bought the next SOCKET_RECHECK_SECONDS of
+      // send/ack/typing for a device that may be lapsed, revoked or blocked, because the next
+      // frame short-circuited on the stamp this call had just written. Leaving it unwritten
+      // means the very next frame retries.
+      return true;
     }
+    // Only a real answer resets the throttle.
+    await this.ctx.storage.put(key, now());
     if (row && row.status === "active") return true;
     this.dropSockets(device);
     return false;
+  }
+
+  /// Which of these device ids still have a live, entitled licence, or `null` if we could not
+  /// find out. `null` is deliberately distinct from an empty set: the caller fails OPEN on it.
+  ///
+  /// One D1 round trip for the whole list rather than one per device, because it runs inside the
+  /// push alarm and the list is every Mac on this inbox.
+  async entitledDevices(ids) {
+    if (!ids.length) return new Set();
+    try {
+      const rows = await this.env.DB.prepare(
+        "SELECT d.id AS id FROM devices d JOIN licenses l ON l.license_hash = d.license_hash " +
+        `WHERE d.id IN (${ids.map(() => "?").join(",")}) AND d.revoked_at IS NULL ` +
+        "AND l.status = 'active' " +
+        "AND (l.entitled_until IS NULL OR l.entitled_until > ?)"
+      ).bind(...ids, now()).all();
+      return new Set((rows.results ?? []).map((r) => r.id));
+    } catch {
+      return null;   // fail open, see the caller
+    }
   }
 
   /// Close every socket belonging to one device.
@@ -1555,10 +1904,21 @@ export class UserInbox {
     // ONE push however many messages are pending. The payload has no content, so a second
     // notification would say exactly the same thing as the first.
     const newest = this.one("SELECT peer FROM messages WHERE seq = ?", latest);
-    const targets = this.rows(
+    let targets = this.rows(
       "SELECT device_id, apns_token, apns_env FROM devices " +
       "WHERE apns_token IS NOT NULL AND last_acked_seq < ? AND last_pushed_seq < ?",
       latest, latest);
+    // The SAME entitlement clause as `authenticate`, `authenticateToken` and `stillAuthorized`.
+    // This table is the Durable Object's own and knows nothing about licences, so it has to ask
+    // D1 by hand, and leaving it out made push the one delivery path that survived a lapse: a
+    // lapsed recipient's socket was dropped and every HTTP route 401'd, while this still sent
+    // them a banner for each new conversation, indefinitely, for messages they could not open.
+    //
+    // Fails OPEN on a D1 error, exactly like `stillAuthorized`: this is a revocation check, not
+    // the authentication itself, and silencing everybody's notifications because D1 blipped
+    // would be the worse failure by far.
+    const live = await this.entitledDevices(targets.map((t) => t.device_id));
+    if (live) targets = targets.filter((t) => live.has(t.device_id));
     if (!targets.length) {
       // Everyone has either acked or been pushed, so whatever we were retrying is done.
       await this.ctx.storage.delete(PUSH_ATTEMPT_KEY);
@@ -1754,9 +2114,14 @@ export default {
     }
 
     if (path.startsWith("/v1/")) {
-      const auth = await authenticate(request, env, ctx);
+      // Release is cleanup, not access, so it authenticates WITHOUT the entitlement clause:
+      // see the note on `authenticateToken`. Matched before the general gate because that gate
+      // is exactly what used to 401 it.
+      const releasing = path === "/v1/devices/release" && method === "POST";
+      const auth = await authenticate(request, env, ctx, { allowExpired: releasing });
       if (!auth) return fail(401, "reactivate");
 
+      if (releasing) return releaseDevice(env, auth);
       if (path === "/v1/invites" && method === "POST") return createInvite(env, auth);
       if (path === "/v1/invites/accept" && method === "POST") return acceptInvite(request, env, auth);
       if (path === "/v1/sync" && method === "GET") return syncMessages(env, auth, url);
@@ -1764,7 +2129,6 @@ export default {
         return inboxCall(env, auth.identityID, "/friends/list", {});
       }
       if (path === "/v1/push" && method === "POST") return registerPush(request, env, auth);
-      if (path === "/v1/devices/release" && method === "POST") return releaseDevice(env, auth);
 
       const friend = path.match(/^\/v1\/friends\/([0-9a-f]{64})\/(block|unblock|remove)$/);
       if (friend && method === "POST") return friendAction(env, auth, friend[1], friend[2]);

@@ -30,6 +30,32 @@
     // right app. Public, not a secret: it is the id in every App Store URL, which is why
     // it sits here in version control rather than in a wrangler secret nobody can see.
     "APPSTORE_APP_APPLE_ID": "6792833686"
+
+    // Optional. Space or comma separated App Store product ids for the Friends and Spore Storage
+    // subscription, matching StoreEntitlement.productIDMonthly / .productIDYearly in the app.
+    // Empty (the default) means this deployment does not sell one, which is right for a
+    // self-hosted box: its ENTITLEMENT_CUTOVER is 0, so nothing ever asks for a subscription.
+    // ,"APPSTORE_SUBSCRIPTION_PRODUCT_IDS": "com.qubit.shroomy.app.membership.monthly com.qubit.shroomy.app.membership.yearly"
+
+    // Optional. Unix seconds. Purchases from BEFORE this instant keep Friends forever; from
+    // after it, a live subscription is required. The code default is 0, which means
+    // grandfather everyone, and that is what a self-hosted box should keep: it makes an
+    // install that never expires and never asks Gumroad about a subscription.
+    //
+    // Leaving it 0 is also how this deploys as a no-op on our own servers. Flip it only once
+    // a build that can actually sell a subscription is live and adopted, because until then
+    // a refused user has no way to buy their way back in. Reversing it is one config deploy
+    // and no code change, which is exactly why it lives here and not in worker.js.
+    // ,"ENTITLEMENT_CUTOVER": "0"
+
+    // Optional. Activations per hour per IP, guarding the Gumroad round trip behind
+    // /v1/devices/activate; the code default is 10 (`activationsPerHourPerIP`). Worth
+    // raising on a box whose users share one address, and worth knowing about if you run
+    // the two-instance debug workflow in README.md: a single Mac spends five or six in a
+    // few minutes, so the 429 lands on somebody testing rather than on a flood. Our own
+    // deployment runs 20. Applied per request, so a change takes effect immediately
+    // rather than at the next window.
+    // ,"ACTIVATIONS_PER_HOUR_PER_IP": "20"
   },
 
   "d1_databases": [

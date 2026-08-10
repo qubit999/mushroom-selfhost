@@ -34,7 +34,8 @@ Three things are unavailable on a self-hosted deployment:
   LAN cannot be reached at all. Tailscale is the simplest answer and needs no certificate
   management.
 - One Mushroom licence per person. Three Macs per person, as usual.
-- The direct download of Mushroom. The Mac App Store version cannot use custom servers.
+- Mushroom, either version. Settings, Data, Servers is in the direct download and, since build
+  111, in the Mac App Store build too.
 
 If you would rather not run Docker, see **Without Docker** at the end.
 

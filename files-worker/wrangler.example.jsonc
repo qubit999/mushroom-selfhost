@@ -39,6 +39,24 @@
     "APPSTORE_APP_APPLE_ID": "6792833686",
     "PUBLIC_BASE": "https://files.getmushroom.app",
 
+    // Optional. Space or comma separated App Store product ids for the Friends and Spore Storage
+    // subscription, matching StoreEntitlement.productIDMonthly / .productIDYearly in the app.
+    // Empty (the default) means this deployment does not sell one, which is right for a
+    // self-hosted box: its ENTITLEMENT_CUTOVER is 0, so nothing ever asks for a subscription.
+    // "APPSTORE_SUBSCRIPTION_PRODUCT_IDS": "com.qubit.shroomy.app.membership.monthly com.qubit.shroomy.app.membership.yearly",
+    // Optional. Unix seconds. Purchases from BEFORE this instant keep Spore Storage forever;
+    // from after it, a live subscription is required. The code default is 0, which means
+    // grandfather everyone, and that is what a self-hosted box should keep: it makes an
+    // install that never expires and never asks Gumroad about a subscription.
+    //
+    // MUST match mushroom-messaging's value. Two different cutovers means a subscriber keeps
+    // one feature and loses the other, which reads as a bug in whichever half broke.
+    //
+    // Leaving it 0 is also how this deploys as a no-op on our own servers. Flip it only once a
+    // build that can actually sell a subscription is live and adopted, because until then a
+    // refused user has no way to buy their way back in.
+    // "ENTITLEMENT_CUTOVER": "0",
+
     // Where the expired and removed pages link, and where the bare root redirects. Those two
     // pages are the only thing this Worker ever shows a person who is not running Mushroom.
     // Set it to "" and the deployment names nobody: the root answers 404 and the pages carry

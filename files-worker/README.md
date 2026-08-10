@@ -14,7 +14,7 @@ would shadow a route here.
 | `worker.js` | Everything. Routes, Gumroad verification, the sweep. |
 | `wrangler.jsonc` | Bindings, cron, custom domain. |
 | `migrations/0001_init.sql` | D1 schema. |
-| `test.sh` | Smoke matrix against `wrangler dev`. |
+| `test.sh / test-entitlement.sh` | Smoke matrix against `wrangler dev`. |
 | `vector.mjs` | The sealed-file format, asserted against the same fixed vector the Mac uses. Run by `test.sh`. |
 
 ## First-time setup

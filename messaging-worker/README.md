@@ -220,6 +220,22 @@ Node 22+ for the global `WebSocket`, no dependency to install. Check against
 `wrangler dev --remote` before deploying, because local D1 and DO emulation is not the same
 code path as the real thing.
 
+`test-entitlement.sh` covers the subscription horizon (`entitled_until`), which `test.sh`
+deliberately does not: that file is also the on-prem conformance suite, and a self-hosted box
+runs with the entitlement switched off. Run it against the same `wrangler dev`:
+
+```bash
+./test-entitlement.sh
+```
+
+Its last two assertions are the reason it exists. Every HTTP route re-reads the row on each
+request, but a WebSocket is authenticated once at the upgrade and is hibernation-backed, so
+`UserInbox.stillAuthorized` is the only thing that can notice a horizon passing under a live
+connection. It drives that through `entitlement-socket.mjs`, first as a control (an unexpired
+licence must still answer a ping) and then for real (a horizon seconds away must close the
+socket). Drop the entitlement clause from `stillAuthorized` and only the second one fails,
+which is exactly the regression it is there for.
+
 `alarm-test.sh` stands apart from both, and owns its own server, because the thing it asks
 about lives in workerd's `_cf_ALARM` table and that can only be read once the process has let
 go of the file:
@@ -423,6 +439,18 @@ the banner.
   of its own, which is what keeps two friends replying simultaneously from deadlocking. Keep
   it that way: anything new that both awaits another inbox AND can be awaited by one
   reintroduces the cycle.
+
+- **An inbox accepts messages from itself, and they never leave the object.** One identity can
+  be activated on several Macs, and the app uses a message addressed to its own inbox to carry
+  the three things this server does not hold: a copy of what was sent (`deliver` files a message
+  in the RECIPIENT's inbox, so an outbox becomes a stored row nowhere and a second Mac would see
+  only the friend's half of every conversation), what the user calls people, and how far they
+  have read. All of it is sealed like ordinary speech, so this side learns nothing new. Two
+  consequences worth knowing: `handleSend` calls `this.deliver` DIRECTLY for its own identity
+  rather than re-entering itself through `inboxCall`, which is a fetch to the object that is
+  making it; and `deliver` arms no push alarm for one, or a Mac asleep in another room would
+  announce a message its owner had just typed on the Mac in front of them. Covered by
+  `SELF=1 BOGUS_KEY=1 ./alarm-test.sh` and the "our own Macs" block in `socket-test.mjs`.
 
 - **A frame can be text or binary.** The Mac app sends binary, Node and browsers send text.
   `webSocketMessage` decodes both. Parsing only one silently drops every frame from the other.

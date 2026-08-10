@@ -13,6 +13,13 @@
 #   ./alarm-test.sh                 # against `wrangler dev`, the hosted reference environment
 #   SELFHOST=1 ./alarm-test.sh      # against a workerd box, the way a customer runs it
 #
+# A third question, asked with SELF=1 BOGUS_KEY=1: does a message the user sent to their OWN
+# inbox arm one? It must not. One identity can be activated on several Macs, and the app copies
+# every message it sends to itself so the user's other Macs can show it; if that armed the push
+# alarm, a Mac asleep in another room would announce a message its owner had just typed on the
+# Mac in front of them, once per message, forever. BOGUS_KEY is not optional there: with APNs
+# unconfigured the whole branch is skipped for every message and the answer means nothing.
+#
 # In wrangler mode the answer lives in workerd's `_cf_ALARM` table, which can only be read once
 # the process has let go of the file, which is why this waits and then kills the server.
 #
@@ -112,12 +119,20 @@ CODE=$(curl -s -X POST "${A[@]}" "$BASE/v1/invites" |
 curl -s -o /dev/null -X POST "${B[@]}" -H 'content-type: application/json' \
   -d "{\"code\":\"$CODE\"}" "$BASE/v1/invites/accept"
 
-# Bob needs a push token, or `alarm()` returns on an empty target list and would look fixed
-# for the wrong reason.
-curl -s -o /dev/null -X POST "${B[@]}" -H 'content-type: application/json' \
+# SELF=1 sends to Alice's OWN inbox instead of Bob's, so the push token has to go there too:
+# `alarm()` reads the tokens of the inbox holding the message.
+if [ "${SELF:-0}" = "1" ] && [ "${BOGUS_KEY:-0}" != "1" ]; then
+  printf '  \033[31mFAIL\033[0m SELF=1 needs BOGUS_KEY=1, or the branch under test is skipped for every message\n'
+  exit 1
+fi
+if [ "${SELF:-0}" = "1" ]; then TARGET_ID="$ALICE_ID"; PUSH=("${A[@]}"); else TARGET_ID="$BOB_ID"; PUSH=("${B[@]}"); fi
+
+# The recipient needs a push token, or `alarm()` returns on an empty target list and would look
+# fixed for the wrong reason.
+curl -s -o /dev/null -X POST "${PUSH[@]}" -H 'content-type: application/json' \
   -d "{\"token\":\"$(printf 'a%.0s' {1..64})\",\"environment\":\"sandbox\"}" "$BASE/v1/push"
 
-BASE="$BASE" node alarm-test.mjs "$ALICE_TOKEN" "$BOB_ID" || {
+BASE="$BASE" node alarm-test.mjs "$ALICE_TOKEN" "$TARGET_ID" || {
   echo "  FAIL  the message was not accepted, so this proves nothing"; exit 1; }
 
 sleep 20   # PUSH_GRACE_MS is 10s, so an armed alarm has fired and re-armed by now
@@ -200,6 +215,23 @@ if [ "$STORED" -lt 1 ]; then
   exit 1
 fi
 printf '  \033[32mok\033[0m   the message was stored (%s)\n' "$STORED"
+
+if [ "${SELF:-0}" = "1" ]; then
+  # The control that stops this passing for the wrong reason. APNs IS configured here, and a
+  # token IS stored in the inbox holding the message, so the only thing standing between this
+  # message and an armed alarm is that it came from the identity it was sent to.
+  if [ "${TOKENS:-0}" -lt 1 ]; then
+    printf '  \033[31mFAIL\033[0m no push token stored, so nothing could have been pushed at anyway\n'
+    exit 1
+  fi
+  printf '  \033[32mok\033[0m   a push token is stored, so the target list is not empty\n'
+  if [ "${ALARMS:-0}" -eq 0 ]; then
+    printf '  \033[32mok\033[0m   the user'"'"'s own message armed no push alarm\n'
+    exit 0
+  fi
+  printf '  \033[31mFAIL\033[0m %s push alarm(s) armed for the user'"'"'s own message: their other Mac will be told about it\n' "$ALARMS"
+  exit 1
+fi
 
 if [ "${BOGUS_KEY:-0}" = "1" ]; then
   # A key that cannot sign SHOULD retry: the failures this retry was written for (a throttled

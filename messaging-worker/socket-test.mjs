@@ -165,6 +165,48 @@ async function main() {
     bad("ack turns into a delivered receipt", error.message);
   }
 
+  // ---------------------------------------------------------------- our own Macs
+  //
+  // One identity, several Macs. The app copies what it sends to its own inbox, because
+  // `deliver` files a message in the RECIPIENT's inbox and our outbox therefore becomes a
+  // stored row nowhere: without this a second Mac shows every message a friend sent and none
+  // of the replies. Same for what the user calls people and what they have read.
+  //
+  // Alice's second socket stands in for that second Mac. It is opened first, so a frame that
+  // arrives before it is listening cannot make this pass by accident.
+  const aliceMac2 = connect(aliceToken);
+  await aliceMac2.open();
+
+  a.send({ t: "send", msg_id: "self1", peer_id: alice, ciphertext: sealed("to myself"),
+           sent_at: Math.floor(Date.now() / 1000) });
+  try {
+    const selfAccepted = await a.next("accepted");
+    want("a message to our own identity is accepted", "self1", selfAccepted.msg_id);
+  } catch (error) {
+    bad("a message to our own identity is accepted", error.message);
+  }
+
+  // THE assertion. Everything else here is satisfied by a send that goes nowhere.
+  try {
+    const onMac2 = await aliceMac2.next("message");
+    want("it reaches the user's other Mac", "self1", onMac2.message.msg_id);
+    want("stamped from ourselves, which is what tells the app it is ours",
+         alice, onMac2.message.peer_id);
+    want("ciphertext survives untouched", sealed("to myself"), onMac2.message.ciphertext);
+  } catch (error) {
+    bad("it reaches the user's other Mac", error.message);
+  }
+
+  // And nobody else's. `send()` fans out to every socket on ONE inbox, but a bug that filed it
+  // in the friend's inbox instead would look identical from Alice's side.
+  want("and never reaches the friend", true, await b.none("message"));
+
+  const selfSync = await (await fetch(`${BASE}/v1/sync?after=0`, {
+    headers: { authorization: `Bearer ${aliceToken}` },
+  })).json();
+  want("stored in our OWN inbox, for a Mac that was not connected", 1, selfSync.messages.length);
+  aliceMac2.close();
+
   // ---------------------------------------------------------------- typing
   a.send({ t: "typing", peer_id: await bobIdentity() });
   try {
