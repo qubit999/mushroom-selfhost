@@ -305,6 +305,103 @@ else
 fi
 
 echo
+echo "device management"
+
+# Reads a field out of the /v1/devices payload. `field()` only reaches top-level scalars and
+# everything interesting here is inside the array.
+devices() { python3 -c "import json,sys; d=json.load(sys.stdin); print($1)" < "$BODY" 2>/dev/null; }
+
+# A device on a DIFFERENT licence, which is what the scoping assertions below are about.
+# Without one, "revoking someone else's device is refused" would pass against an empty table
+# for the wrong reason.
+STRANGER="$(sha 'STRANGER-LICENSE')"
+d1 "INSERT OR REPLACE INTO licenses (license_hash, status, checked_at, created_at)
+    VALUES ('$STRANGER', 'active', $NOW, $NOW);"
+d1 "INSERT OR REPLACE INTO devices (id, identity_id, license_hash, token_hash, name, created_at, last_seen_at)
+    VALUES ('dev-stranger', '$ALICE_ID', '$STRANGER', '$(sha 'stranger-token')', 'Someone Else Mac', $NOW, $NOW);"
+
+status "${A[@]}" "$BASE/v1/devices" >/dev/null
+want "the device list is readable"          "2" "$(devices 'len(d["devices"])')"
+want "and reports the seat limit"           "5" "$(devices 'd["limit"]')"
+# Scoped on license_hash, not identity_id: the cap counts per licence, so a list keyed on
+# identity would omit exactly the rows consuming the seats.
+want "another licence is not listed"        "0" "$(devices '''sum(1 for x in d["devices"] if x["id"]=="dev-stranger")''')"
+want "this device is flagged"               "dev-alice" "$(devices '''next(x["id"] for x in d["devices"] if x["this_device"])''')"
+# A token is never returned. It is not even selected, but the assertion is cheap and the rule
+# it protects (ids and status codes only, never a credential) is not.
+want "no token leaks into the list"         "0" "$(devices '''sum(1 for x in d["devices"] if "token" in x)''')"
+
+status -X POST "${A[@]}" "$BASE/v1/devices/revoke" -H 'content-type: application/json' -d '{}' >/dev/null
+want "revoke needs a device id"             "bad_device" "$(code)"
+status -X POST "${A[@]}" "$BASE/v1/devices/revoke" -H 'content-type: application/json' \
+  -d '{"device_id":"dev-alice"}' >/dev/null
+want "revoking yourself is refused"         "cannot_revoke_self" "$(code)"
+# 404 rather than 403, and the same answer as a device id that never existed: a distinguishable
+# code would turn this endpoint into an oracle for whether an id is real.
+status -X POST "${A[@]}" "$BASE/v1/devices/revoke" -H 'content-type: application/json' \
+  -d '{"device_id":"dev-stranger"}' >/dev/null
+want "another licence's device is refused"  "not_found" "$(code)"
+want "and the stranger is still live"       "1" "$(d1_json "SELECT COUNT(*) AS n FROM devices WHERE id='dev-stranger' AND revoked_at IS NULL" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["n"])')"
+status -X POST "${A[@]}" "$BASE/v1/devices/revoke" -H 'content-type: application/json' \
+  -d '{"device_id":"nope"}' >/dev/null
+want "an unknown device is refused"         "not_found" "$(code)"
+
+# The real thing: Alice signs Bob's Mac out.
+want "revoking a peer device succeeds"      "200" "$(status -X POST "${A[@]}" "$BASE/v1/devices/revoke" -H 'content-type: application/json' -d '{"device_id":"dev-bob"}')"
+want "the revoked device cannot call"       "401" "$(status -X POST "${B[@]}" "$BASE/v1/invites")"
+status "${A[@]}" "$BASE/v1/devices" >/dev/null
+want "and it is off the list"               "1" "$(devices 'len(d["devices"])')"
+
+# Put Bob back. The rate-limit block below is the only thing after this, but leaving the seed
+# broken would make this suite order-dependent for anything added later.
+d1 "UPDATE devices SET revoked_at = NULL WHERE id = 'dev-bob';"
+# Proved with a READ. Creating an invite would also prove it and would spend one of Bob's
+# twenty a day, which the rate-limit block below is about to care about.
+want "bob is restored for later runs"       "200" "$(status "${B[@]}" -o /dev/null "$BASE/v1/friends")"
+
+echo
+echo "apns key parsing (pure, no server)"
+
+# `apnsPEM` is the whole reason push can fail with the alarm reporting Ok: a mangled .p8 threw
+# inside a catch that swallowed it, and no notification was sent on ANY platform for as long as
+# the secret was stored that way. These run the real function out of worker.js.
+#
+# The ordering assertion is the one that matters. Stripping "everything outside base64" before
+# the escape sequences removes the backslash of `\n` and KEEPS the `n`, which is valid base64,
+# so the key decodes to the wrong bytes instead of failing. That is worse than the outage.
+apns_case() {
+  node -e '
+    const src = require("fs").readFileSync("worker.js","utf8");
+    eval(src.match(/function apnsPEM\(env\) \{[\s\S]*?\n\}/)[0]);
+    const body = "MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQg" + "A".repeat(64);
+    // The armour lines are ASSEMBLED rather than written out, and that is not style. This file
+    // is published to qubit999/mushroom-selfhost, and publish-selfhost.sh scans the staged tree
+    // for PEM armour before it will release anything. Spelled in full, this fixture (a fake
+    // body of 64 A bytes, no secret anywhere) fails that gate on every run, and the comments in
+    // that script say why that is the worst outcome: a gate that always fails is a gate
+    // somebody stops running. Keep any future PEM fixture split the same way.
+    //
+    // No apostrophes anywhere in this node block, comments included: it is one single-quoted
+    // shell argument, so one apostrophe ends the string and the rest becomes a syntax error.
+    const tag = (w) => "-----" + w + " PRIVATE" + " KEY-----";
+    const armour = (sep, pre = "", post = "") =>
+      pre + tag("BEGIN") + sep + body + sep + tag("END") + sep + post;
+    const cases = {
+      newlines: armour("\n"),
+      escaped:  armour("\\n"),
+      crlf:     armour("\r\n"),
+      quoted:   armour("\\n", "\"", "\""),
+      junk:     armour("\n", "", "%"),
+    };
+    const out = apnsPEM({ APNS_KEY_P8: cases[process.argv[1]] });
+    console.log(out === body ? "exact" : "WRONG");
+  ' "$1" 2>/dev/null
+}
+for c in newlines escaped crlf quoted junk; do
+  want "a .p8 with $c decodes exactly" "exact" "$(apns_case $c)"
+done
+
+echo
 echo "rate limits (exhausting, kept last)"
 for _ in $(seq 1 20); do status -X POST "${A[@]}" "$BASE/v1/invites" >/dev/null; done
 want "invites are capped per day"           "429" "$(status -X POST "${A[@]}" "$BASE/v1/invites")"

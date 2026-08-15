@@ -24,7 +24,11 @@ const MAX_ACTIVE_FILES_PER_LICENSE = 50;
 // 50 files at MAX_FILE_BYTES would be 4.6 GiB, so this binds first at ~32 max-size files.
 // Deliberate: the file count is the cap for ordinary drops, this is the cap on the bill.
 const MAX_ACTIVE_BYTES_PER_LICENSE = 3 * 1024 * 1024 * 1024;
-const MAX_DEVICES_PER_LICENSE = 3;              // matches the license: "up to 3 Macs"
+// MUST stay equal to mushroom-messaging's copy AND to `LicenseVerifier.seatCap`. See the long
+// note there. All three were 3 and all three are 5 as of the iPhone companion: the app spends
+// five activations on Gumroad, both Workers keep five device rows, and that is one allowance
+// rather than two numbers that happen to be near each other.
+const MAX_DEVICES_PER_LICENSE = 5;
 const MAX_NAME_CHARS = 120;
 const MAX_DEVICE_NAME_CHARS = 60;
 const PENDING_GRACE_SECONDS = 60 * 60;          // abandoned uploads
@@ -203,7 +207,7 @@ async function storedBytesMatchType(env, key, contentType) {
 /// sale: we store sha256(key), and a hash cannot be reversed.
 ///
 /// increment_uses_count is FALSE on purpose. The app burns a seat once, at activation
-/// (LicenseManager.activate), and the license allows three Macs. Counting again here
+/// (LicenseManager.activate), and the license allows five devices. Counting again here
 /// would spend the user's seats on our own bookkeeping.
 /// Tries each product in turn and returns the first real answer. "invalid" from the membership
 /// only means "not one of ours from THAT product", so it must fall through to the one-time
@@ -325,7 +329,7 @@ const appStoreHash = (appTransactionID) => sha256Hex(`appstore:${appTransactionI
 
 /// How many Macs THIS licence row may keep, counted across every row that shares the sale.
 ///
-/// One membership sale means three Macs IN TOTAL, not three per row, and rows multiply because a
+/// One membership sale means five devices IN TOTAL, not five per row, and rows multiply because a
 /// redeeming App Store account gets its own row keyed on its own app transaction while a
 /// direct-build Mac hashes the key itself. Applying this to the redeem branch alone bounded the
 /// redeemers against each other and then handed the ordinary Gumroad branch a full fresh three on
@@ -334,8 +338,8 @@ const appStoreHash = (appTransactionID) => sha256Hex(`appstore:${appTransactionI
 /// spends a Gumroad seat to find out.
 ///
 /// Counted in MACS, not in rows. Counting rows capped the number of Apple Accounts while each of
-/// those rows went on to keep its own three devices under the eviction, and it made the client's
-/// sentence ("already set up on three Macs") name a unit nothing was counting.
+/// those rows went on to keep its own five devices under the eviction, and it made the client's
+/// sentence ("already set up on five devices") name a unit nothing was counting.
 ///
 /// Excludes this hash so re-activating a Mac that is already counted stays free. A response with no
 /// sale id cannot be counted, so it is let through rather than refused (§12 fail-open); the live API
@@ -586,7 +590,7 @@ async function activateDevice(request, env) {
   // deliberately set a horizon is a grandfathered one.
   let entitledUntil = null;
   // How many Macs THIS row may keep once it is written. Only the redeem path lowers it, so
-  // that one membership sale means three Macs in total rather than three per Apple Account:
+  // that one membership sale means five devices in total rather than five per Apple Account:
   // see the seat cap below and the eviction that spends this budget.
   let deviceBudget = MAX_DEVICES_PER_LICENSE;
 

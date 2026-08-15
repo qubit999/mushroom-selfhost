@@ -36,7 +36,7 @@ own values; ours is not included, because it holds the database ids of our hoste
 - Node 22+ and `npx`.
 - A Mushroom licence for each person, bought normally. Running the servers does not replace
   the app licence, and one key must not be shared: each employee activates their own, and the
-  three-Mac allowance is then three Macs *per person*, which is what it is meant to be.
+  five-device allowance is then five devices *per person*, which is what it is meant to be.
 
 ## Files server (`files-worker`)
 

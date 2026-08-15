@@ -29,7 +29,22 @@ const MAX_MESSAGE_CHARACTERS = 4000;
 // bound on the STORED blob rather than a second opinion about the text.
 const MAX_CIPHERTEXT_CHARS = Math.ceil((MAX_MESSAGE_CHARACTERS * 4 + 28) * 4 / 3) + 64;
 const MAX_FRIENDS = 50;
-const MAX_DEVICES_PER_LICENSE = 3;              // matches the license: "up to 3 Macs"
+// MUST stay equal to `LicenseVerifier.seatCap` and to files-worker's copy of this constant.
+// All three were 3, all three are 5, and they agree again as of the iPhone companion: the
+// app spends five ACTIVATIONS on Gumroad and the server keeps five device rows, which is one
+// allowance described in one way, and `saleSeatBudget` counts it across every row sharing a
+// sale. They were briefly out of step (Workers at 5, licence at 3) and the symptom of that is
+// invisible rather than loud, because `verifyLicenseAgainst` sends `increment_uses_count:
+// "false"` and a device registering here never spends a Gumroad use.
+//
+// 5 rather than 3 because the cap does not refuse, it EVICTS the least-recently-seen device:
+// at 3, a phone joining a desk Mac and a laptop signed one of the Macs out mid-conversation.
+//
+// Changing this is a COPY change as much as a code one. The number appears across Mushroom_www
+// (index, faq including its JSON-LD answer, terms, help, llms.txt), the marketing/ Gumroad
+// descriptions and the app's own strings in all five languages, and both Workers and the app
+// must move together. Keep the wording "devices", not "Macs".
+const MAX_DEVICES_PER_LICENSE = 5;
 const MAX_DEVICE_NAME_CHARS = 60;
 // A UUID is 36. Bounded because the id is stored and rebroadcast, so an unbounded one is a
 // way past the ciphertext cap and into a friend's storage quota (see `handleSend`).
@@ -322,7 +337,7 @@ const appStoreHash = (appTransactionID) => sha256Hex(`appstore:${appTransactionI
 
 /// How many Macs THIS licence row may keep, counted across every row that shares the sale.
 ///
-/// One membership sale means three Macs IN TOTAL, not three per row, and rows multiply because a
+/// One membership sale means five devices IN TOTAL, not five per row, and rows multiply because a
 /// redeeming App Store account gets its own row keyed on its own app transaction while a
 /// direct-build Mac hashes the key itself. Applying this to the redeem branch alone bounded the
 /// redeemers against each other and then handed the ordinary Gumroad branch a full fresh three on
@@ -331,8 +346,8 @@ const appStoreHash = (appTransactionID) => sha256Hex(`appstore:${appTransactionI
 /// a Gumroad seat to find out.
 ///
 /// Counted in MACS, not in rows. Counting rows capped the number of Apple Accounts while each of
-/// those rows went on to keep its own three devices under the eviction, and it made the client's
-/// sentence ("already set up on three Macs") name a unit nothing was counting.
+/// those rows went on to keep its own five devices under the eviction, and it made the client's
+/// sentence ("already set up on five devices") name a unit nothing was counting.
 ///
 /// Excludes this hash so re-activating a Mac that is already counted stays free. A response with no
 /// sale id cannot be counted, so it is let through rather than refused (§12 fail-open); the live API
@@ -663,7 +678,7 @@ async function activateDevice(request, env) {
   // deliberately set a horizon is a grandfathered one.
   let entitledUntil = null;
   // How many Macs THIS row may keep once it is written. BOTH credential branches lower it, so
-  // that one membership sale means three Macs in total rather than three per Apple Account:
+  // that one membership sale means five devices in total rather than five per Apple Account:
   // see `saleSeatBudget` and the eviction that spends this budget.
   let deviceBudget = MAX_DEVICES_PER_LICENSE;
 
@@ -890,7 +905,7 @@ async function activateDevice(request, env) {
 
   // Past the cap, evict the least-recently-seen Mac rather than refusing. A 409 would
   // strand someone who reinstalled twice, and the evicted Mac silently re-activates on its
-  // next 401. Scoped to the license, not the identity: three Macs, however many keys.
+  // next 401. Scoped to the license, not the identity: five devices, however many keys.
   const live = await env.DB.prepare(
     "SELECT id, identity_id FROM devices WHERE license_hash = ? AND revoked_at IS NULL " +
     "ORDER BY last_seen_at DESC"
@@ -929,6 +944,77 @@ async function releaseDevice(env, auth) {
   // the user gets banners for an identity the app has discarded and cannot open.
   await inboxCall(env, auth.identityID, "/devices/remove", { device: auth.deviceID })
     .catch(() => {});
+  return reply(200, {});
+}
+
+/// Every device this LICENCE is paying for, so the user can see and manage them.
+///
+/// Scoped to `license_hash`, not to `identity_id`, and the difference is the whole point: the
+/// cap counts devices per licence, so a list keyed on identity would omit exactly the rows that
+/// are consuming the seats the user is being evicted over.
+///
+/// Ids, names and timestamps only. Same logging rule as everywhere else in this file: nothing
+/// here reveals a token (only `token_hash` is stored, and it is not selected) or a message.
+async function listDevices(env, auth) {
+  const rows = await env.DB.prepare(
+    "SELECT id, name, created_at, last_seen_at FROM devices " +
+    "WHERE license_hash = ? AND revoked_at IS NULL ORDER BY last_seen_at DESC"
+  ).bind(auth.licenseHash).all();
+  return reply(200, {
+    limit: MAX_DEVICES_PER_LICENSE,
+    devices: (rows.results ?? []).map((row) => ({
+      id: row.id,
+      name: row.name,
+      created_at: row.created_at,
+      last_seen_at: row.last_seen_at,
+      // So the app can label the row the user is holding, and refuse to let them sign THIS
+      // device out from a list whose whole purpose is managing the others. Computed here
+      // rather than compared client side, because the client does not otherwise need to know
+      // its own device id is comparable to these.
+      this_device: row.id === auth.deviceID,
+    })),
+  });
+}
+
+/// Sign another of this licence's devices out.
+///
+/// Deliberately NOT a cryptographic revocation, and the UI must not claim otherwise: the
+/// revoked device still holds the X25519 identity key in its own Keychain and can activate
+/// again if it still has the credential. What this does is free the seat and stop delivery.
+/// Losing a device for real means Start Over, which mints a new identity.
+///
+/// Scoped to the caller's own `license_hash`, exactly like the reclaim path in
+/// `activateDevice`, so a device id lifted from somewhere else cannot revoke another licence's
+/// Mac. Without that clause this endpoint would be a way to sign out any device whose id you
+/// could guess or observe.
+async function revokeDevice(request, env, auth) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return fail(400, "bad_json");
+  }
+  const target = typeof body.device_id === "string" ? body.device_id.slice(0, 64) : null;
+  if (!target) return fail(400, "bad_device");
+  // Refused rather than silently allowed. Signing yourself out from the device list is
+  // `releaseDevice`'s job, and doing it here would leave the app holding a token it believes
+  // is good while every later call 401s.
+  if (target === auth.deviceID) return fail(400, "cannot_revoke_self");
+
+  const row = await env.DB.prepare(
+    "SELECT identity_id FROM devices WHERE id = ? AND license_hash = ? AND revoked_at IS NULL"
+  ).bind(target, auth.licenseHash).first();
+  // Same answer whether the row belongs to someone else or never existed: a distinguishable
+  // 404 would turn this into an oracle for whether a given device id is real.
+  if (!row) return fail(404, "not_found");
+
+  await env.DB.prepare("UPDATE devices SET revoked_at = ? WHERE id = ?")
+    .bind(now(), target).run();
+  // Out of the INBOX as well as D1, for the same reason the eviction in `activateDevice` does
+  // it: a row left there holds that device's still-valid APNs token with a frozen
+  // `last_acked_seq`, so every later message is pushed at a device that can no longer connect.
+  await inboxCall(env, row.identity_id, "/devices/remove", { device: target }).catch(() => {});
+  console.log(`device revoked by peer device=${target}`);
   return reply(200, {});
 }
 
@@ -1090,8 +1176,26 @@ function base64url(bytes) {
 
 function apnsPEM(env) {
   return (env.APNS_KEY_P8 ?? "")
-    .replace(/-----(BEGIN|END) PRIVATE KEY-----/g, "").replace(/\s/g, "");
+    .replace(/-----(BEGIN|END)[^-]*-----/g, "")
+    // Escape sequences FIRST, as pairs, and the order is not cosmetic. A .p8 that travelled
+    // through a shell variable, a CI secret store or a JSON blob arrives with `\n` as two
+    // characters. Strip "everything outside base64" before this and the backslash goes while
+    // the `n` STAYS, because `n` is a perfectly good base64 character: the key then decodes to
+    // the wrong bytes instead of failing, which is worse than the outage it replaced. A unit
+    // check in this file's test.sh pins that ordering.
+    .replace(/\\[rnt]/g, "")
+    // Then anything else outside the alphabet, rather than an ever-growing list of the ways a
+    // .p8 arrives mangled. It has already been three, and the last round still left exactly
+    // one stray character behind.
+    //
+    // Tolerant on purpose, and it decides nothing: what survives is either a valid PKCS#8 key
+    // or it is not, and `crypto.subtle.importKey` is the thing that says so. Being strict here
+    // bought no safety and cost a silent outage, because the failure surfaced as `atob()`
+    // complaining about base64 from inside a catch that swallowed it.
+    .replace(/[^A-Za-z0-9+/=]/g, "");
 }
+
+
 
 /// Whether this deployment can send push AT ALL, as opposed to being able to send it right now.
 ///
@@ -1896,7 +2000,10 @@ export class UserInbox {
     // The backstop for an alarm that was already persisted. `deliver` no longer arms one
     // without a key, but a DO that armed before this shipped still holds it in storage, and
     // that alarm is exactly the one that would re-arm itself forever.
-    if (!apnsConfigured(this.env)) return;
+    if (!apnsConfigured(this.env)) {
+      console.log("push: APNs not configured, alarm is a no-op");
+      return;
+    }
 
     const latest = this.one("SELECT MAX(seq) AS s FROM messages")?.s ?? 0;
     if (!latest) return;
@@ -1917,18 +2024,30 @@ export class UserInbox {
     // Fails OPEN on a D1 error, exactly like `stillAuthorized`: this is a revocation check, not
     // the authentication itself, and silencing everybody's notifications because D1 blipped
     // would be the worse failure by far.
+    const candidates = targets.length;
     const live = await this.entitledDevices(targets.map((t) => t.device_id));
     if (live) targets = targets.filter((t) => live.has(t.device_id));
     if (!targets.length) {
       // Everyone has either acked or been pushed, so whatever we were retrying is done.
+      //
+      // LOGGED, because this branch is why "push does not work" was undiagnosable: every
+      // reason to send nothing (no token stored, already acked, already pushed, not entitled)
+      // ends here and the alarm reports plain Ok. Counts and a seq only, per the file's rule.
+      console.log(`push: nothing to send latest=${latest} candidates=${candidates} entitled=0`);
       await this.ctx.storage.delete(PUSH_ATTEMPT_KEY);
       return;
     }
+    console.log(`push: sending latest=${latest} targets=${targets.length}`);
 
     let jwt;
     try {
       ({ jwt } = await apnsToken(this.env));
-    } catch {
+    } catch (error) {
+      // LOGGED. This is the one failure that looks exactly like success from outside: the
+      // alarm reports Ok, the retry ladder runs quietly, and no push is ever sent. The message
+      // is the error's own, which for a signing failure names the problem (a malformed .p8, a
+      // bad key id) and carries no secret.
+      console.error(`push: could not mint APNs token: ${error?.message ?? error}`);
       // A bad key, or a signing failure. NOT an absent one: the guard at the top of `alarm`
       // already returned for that, which is what stops a keyless deployment re-arming forever.
       // Never take the message path down with it, but DO come back: waiting for "the next
@@ -1944,6 +2063,9 @@ export class UserInbox {
       try {
         const response = await sendPush(this.env, jwt, target.apns_token, target.apns_env,
                                         newest?.peer ?? "mushroom");
+        // Device id, environment and status only. Never the token: it is a credential, and
+        // this file's logging rule is ids and status codes.
+        console.log(`push ${target.device_id} env=${target.apns_env} -> ${response.status}`);
         // 410 is Apple saying that token is dead. Keeping it would push into the void
         // forever and eventually get us throttled.
         if (response.status === 410) {
@@ -1959,7 +2081,10 @@ export class UserInbox {
           if (response.status === 429) cachedAPNsToken = null;
           retry = true;
         }
-      } catch {
+      } catch (error) {
+        // Also logged: a fetch that throws (DNS, TLS, an aborted request) is indistinguishable
+        // from a push that was never attempted, and both end in the same silent retry.
+        console.error(`push ${target.device_id} threw: ${error?.message ?? error}`);
         retry = true;
       }
     }
@@ -2122,6 +2247,10 @@ export default {
       if (!auth) return fail(401, "reactivate");
 
       if (releasing) return releaseDevice(env, auth);
+      if (path === "/v1/devices" && method === "GET") return listDevices(env, auth);
+      if (path === "/v1/devices/revoke" && method === "POST") {
+        return revokeDevice(request, env, auth);
+      }
       if (path === "/v1/invites" && method === "POST") return createInvite(env, auth);
       if (path === "/v1/invites/accept" && method === "POST") return acceptInvite(request, env, auth);
       if (path === "/v1/sync" && method === "GET") return syncMessages(env, auth, url);

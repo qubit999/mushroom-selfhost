@@ -33,7 +33,7 @@ Three things are unavailable on a self-hosted deployment:
 - A hostname your Macs can reach over **https**. The app requires https, so a plain-http box on a
   LAN cannot be reached at all. Tailscale is the simplest answer and needs no certificate
   management.
-- One Mushroom licence per person. Three Macs per person, as usual.
+- One Mushroom licence per person. Five devices per person, as usual.
 - Mushroom, either version. Settings, Data, Servers is in the direct download and, since build
   111, in the Mac App Store build too.
 
@@ -200,6 +200,13 @@ docker compose up -d --build
 Database migrations apply themselves on the first request after the restart. There is no migration
 command to run and none to forget. The volumes and your credentials survive, so the data comes back
 with it.
+
+**Upgrade before an iPhone joins.** Mushroom for iPhone counts against the same five devices a
+licence covers, and versions before this one allowed three. The cap does not refuse the extra
+device, it EVICTS the least recently seen one, so on an older server a phone joining signs out
+one of the Macs, mid conversation, with nothing said about it. This release also adds the two
+endpoints the app uses to list those devices and sign one out on purpose. No new migration is
+involved: `docker compose up -d --build` is the whole upgrade.
 
 ## Checking it works
 
