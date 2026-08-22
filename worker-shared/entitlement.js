@@ -159,3 +159,134 @@ export async function verifyAppSubscription(jws, env, expectedAppTransactionID, 
   }
   return verdict("invalid");
 }
+
+// MARK: Setapp
+
+/// How long a verified Setapp subscription buys before the app has to prove it again.
+///
+/// EXACTLY 24 hours, and shorter than `LICENSE_RECHECK_SECONDS` on purpose. Setapp's integration
+/// terms ask for an access check "every session or at minimum once per 24 hours", and because the
+/// only thing that triggers a re-check is this horizon expiring, the horizon IS the cadence.
+/// Anything longer than a day quietly breaks that promise; there is no second timer behind it.
+///
+/// Its own constant rather than the shared one for the same reason the shared one exists: these
+/// are two different vendors' rules, and a single number serving both would drift into breaking
+/// whichever one it was not chosen for.
+export const SETAPP_RECHECK_SECONDS = 24 * 60 * 60;
+
+/// Whether this deployment can talk to Setapp at all.
+///
+/// Both halves, because neither is any use alone: the client id names the app and the secret
+/// proves we are it. Same shape and the same reasoning as `entitlementMisconfigured` above, and
+/// the same 503 answer, which is the code both clients treat as soft and neither latches.
+///
+/// This is what makes the whole Setapp branch inert until the day it is configured: the code can
+/// ship, the migrations can run, and a build that has never heard of Setapp is unaffected.
+/// A self-hosted box sets neither and is refused here rather than at a network boundary it cannot
+/// cross anyway (`globalOutbound = no-internet`).
+export function setappMisconfigured(env) {
+  return !env.SETAPP_CLIENT_ID || !env.SETAPP_CLIENT_SECRET;
+}
+
+/// Exchange a Setapp authorization code for the answer to one question: may this person use our
+/// app right now?
+///
+/// Returns `{ status, userID }` where status is:
+///   "active"      - Setapp says yes. `userID` is the stable account id to key the licence on.
+///   "refused"     - Setapp says no (lapsed, cancelled, refunded). A real answer, not an error.
+///   "invalid"     - the code was rejected: expired, already spent, or not ours.
+///   "unreachable" - Setapp could not be asked. Transient, and the caller answers 503.
+///
+/// THE CODE IS SINGLE USE AND SHORT LIVED (20 minutes). It is exchanged here, inline, and the
+/// tokens are thrown away: nothing is stored, no refresh token is kept, and there is no
+/// background job. The next check happens because the licence horizon expires and the client
+/// activates again with a code it fetched a moment earlier. That is why the app must never cache
+/// a code: the two Workers each spend their own, and a reused one comes back "invalid".
+///
+/// `SETAPP_API_BASE` exists so the test harness can point this at a stub. It is not a
+/// configuration knob: production sets nothing and gets Setapp.
+export async function verifySetappAccess(code, env, fetchImpl = fetch) {
+  const base = env.SETAPP_API_BASE ?? "https://vendor-api.setapp.com";
+  const verdict = (status, userID = null) => ({ status, userID });
+
+  let token;
+  try {
+    const response = await fetchImpl(`${base}/auth/v1/token`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({
+        grant_type: "authorization_code",
+        code,
+        client_id: env.SETAPP_CLIENT_ID,
+        client_secret: env.SETAPP_CLIENT_SECRET,
+      }),
+    });
+    // 4xx here is the CODE being bad, which no amount of retrying fixes; 5xx and 429 are Setapp
+    // having a moment. Told apart because the client latches one and not the other.
+    if (response.status === 429 || response.status >= 500) return verdict("unreachable");
+    if (!response.ok) return verdict("invalid");
+    const body = await response.json();
+    token = body?.access_token;
+    if (typeof token !== "string" || !token) return verdict("invalid");
+  } catch {
+    return verdict("unreachable");
+  }
+
+  const authed = (path) => fetchImpl(`${base}/resource/v1${path}`, {
+    method: path === "/userinfo" ? "GET" : "POST",
+    headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+  });
+
+  let userID;
+  try {
+    const response = await authed("/userinfo");
+    if (response.status === 429 || response.status >= 500) return verdict("unreachable");
+    // Same rule as `/application/access` below, and for the same reason: the token was just
+    // minted from OUR client id and secret, so a 401 or 403 here is our scope or our deploy, not
+    // the user's licence. Mapping it to `invalid` answered 403 `bad_license` and told a paying
+    // subscriber their licence was bad, which is the one answer §12 forbids handing a paying
+    // user. The CODE is already known good by this point: the token exchange accepted it.
+    if (response.status === 401 || response.status === 403) return verdict("unreachable");
+    if (!response.ok) return verdict("invalid");
+    const body = await response.json();
+    userID = setappUserID(body?.data?.id);
+    if (!userID) return verdict("invalid");
+  } catch {
+    return verdict("unreachable");
+  }
+
+  try {
+    const response = await authed("/application/access");
+    if (response.status === 429 || response.status >= 500) return verdict("unreachable");
+    // 403 here is a scope problem, which is ours, not the user's. Treated as unreachable rather
+    // than as a refusal so a misconfigured deploy cannot tell a paying subscriber they have
+    // lapsed, which is the one answer §12 forbids handing a paying user.
+    if (response.status === 401 || response.status === 403) return verdict("unreachable");
+    if (!response.ok) return verdict("invalid");
+    const body = await response.json();
+    return body?.data?.granted === true ? verdict("active", userID) : verdict("refused");
+  } catch {
+    return verdict("unreachable");
+  }
+}
+
+/// The user id, canonicalised to a decimal string.
+///
+/// The licence hash is `sha256("setapp:" + this)`, so the STRING matters, not the value: if
+/// Setapp sends `12345` today and `"12345"` after some JSON library change, a naive read produces
+/// two different hashes for one person and their Friends identity is refused as claimed by
+/// somebody else. JSON numbers are the hazard, so a number is accepted only when it is a safe
+/// integer and is written back out in the one spelling this function can produce.
+///
+/// Anything else (a float, a huge number, an object, an empty string) is rejected outright: a
+/// hash is forever, and guessing at a shape we have not seen is how the wrong one gets baked in.
+export function setappUserID(raw) {
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    return /^[0-9]+$/.test(trimmed) ? String(BigInt(trimmed)) : null;
+  }
+  if (typeof raw === "number") {
+    return Number.isSafeInteger(raw) && raw >= 0 ? String(raw) : null;
+  }
+  return null;
+}

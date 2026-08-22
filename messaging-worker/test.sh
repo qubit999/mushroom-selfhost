@@ -360,6 +360,104 @@ d1 "UPDATE devices SET revoked_at = NULL WHERE id = 'dev-bob';"
 want "bob is restored for later runs"       "200" "$(status "${B[@]}" -o /dev/null "$BASE/v1/friends")"
 
 echo
+echo "setapp activation (inert until the vendor secrets exist)"
+
+# The whole Setapp branch ships BEFORE Setapp is configured, and this is the proof it is inert:
+# with no SETAPP_CLIENT_ID/SECRET set, every setapp activation answers 503 `setapp_unconfigured`,
+# which is the soft code neither client latches. Nothing else in this suite may change either.
+#
+# The JSON is assembled with SINGLE quotes around the braces. Bash brace-expands an unquoted
+# `{a,b,c}` into three words, and inside a `$(...)` the escaping is re-parsed, so the obvious
+# spelling silently sent three malformed requests and every assertion here read 400 bad_request.
+PROBE_KEY="U0VUQVBQXzMyX2J5dGVfcHVibGljX2tleV9fX19fXwE="
+PHONE_KEY="UEhPTkVfXzMyX2J5dGVfcHVibGljX2tleV9fX19fXwE="
+activate() {
+  status -X POST -H 'content-type: application/json' -d "$1" "$BASE/v1/devices/activate"
+}
+
+json='{"public_key":"'"$PROBE_KEY"'","device_name":"P","setapp_code":"CODE"}'
+want "an unconfigured deploy refuses softly"  "503" "$(activate "$json")"
+want "and says which half is missing"         "setapp_unconfigured" "$(code)"
+
+# Exactly one credential, now counted over four fields rather than compared as two booleans.
+# Picking a winner silently is how one build ends up authenticating as another's licence.
+json='{"public_key":"'"$PROBE_KEY"'","device_name":"P","setapp_code":"C","license_key":"K"}'
+want "two credentials at once is refused"     "400" "$(activate "$json")"
+json='{"public_key":"'"$PROBE_KEY"'","device_name":"P"}'
+want "no credential at all is refused"        "400" "$(activate "$json")"
+json='{"public_key":"'"$PROBE_KEY"'","device_name":"P","setapp_code":"'"$(printf 'x%.0s' $(seq 600))"'"}'
+want "an oversized code is refused"           "400" "$(activate "$json")"
+
+echo
+echo "pairing link codes"
+
+# A Mac mints a one-time code so a phone can join the licence without holding a credential. This
+# is what makes a Setapp Mac able to pair a phone at all: its own credential is a single-use auth
+# code that only a Worker can exchange, so there is nothing to copy across.
+want "a Mac can mint a link code"             "201" "$(status -X POST "${A[@]}" "$BASE/v1/link")"
+LINK_CODE="$(field code)"
+want "and it comes back with an expiry"       "600" "$(field expires_in)"
+if [ -n "$LINK_CODE" ]; then ok "the code is non-empty"; else bad "the code is non-empty"; fi
+
+# Stored hashed, exactly like a device token: for its ten minutes this row is a bearer credential
+# to somebody's Friends identity, and a plaintext table turns a database read into account access.
+want "the code is never stored in the clear"  "0" \
+  "$(d1 "SELECT COUNT(*) AS n FROM link_codes WHERE code_hash = '$LINK_CODE';" | grep -c '\"n\": 1')"
+
+json='{"public_key":"'"$PHONE_KEY"'","device_name":"Phone","link_code":"'"$LINK_CODE"'"}'
+want "a phone redeems it and joins"           "201" "$(activate "$json")"
+PHONE_TOKEN="$(field token)"
+
+# SINGLE USE. The DELETE is the claim, so two phones racing one code cannot both be told yes, and
+# a code recovered from a photograph afterwards is worthless.
+want "the same code cannot be spent twice"    "403" "$(activate "$json")"
+want "and the refusal is bad_license"         "bad_license" "$(code)"
+
+# The phone landed on the SAME licence, which is the entire point: same seats, and an identity
+# the Mac's friends already know. Asserted through the device list rather than by reading the
+# table, because the list is scoped to the caller's licence and is what the user actually sees.
+status "${A[@]}" "$BASE/v1/devices" > /dev/null
+want "the phone is on the Mac's licence"      "1" \
+  "$(python3 -c 'import json;print(sum(1 for d in json.load(open("'"$BODY"'"))["devices"] if d["name"]=="Phone"))')"
+
+echo
+echo "a lapsed entitlement is told apart from a dead token"
+
+# Two different refusals wear a 401. An unknown token means "activate again"; a LIVE token whose
+# licence is merely past its horizon means "somebody has to re-prove this licence" — and for a
+# link-paired phone that somebody is not itself, so answering `reactivate` there would make it
+# throw away the one token it can never replace.
+# Minted while the licence is still healthy, because minting is an authed call: this is the code
+# the lapse block below tries to spend afterwards.
+status -X POST "${A[@]}" "$BASE/v1/link" > /dev/null
+json2='{"public_key":"'"$PHONE_KEY"'","device_name":"Phone2","link_code":"'"$(field code)"'"}'
+
+d1 "UPDATE licenses SET entitled_until = $NOW - 10 WHERE license_hash = '$LICENSE';"
+want "a lapsed licence still 401s"            "401" "$(status "${A[@]}" -o /dev/null "$BASE/v1/friends")"
+status "${A[@]}" "$BASE/v1/friends" > /dev/null
+want "but says the entitlement lapsed"        "entitlement_lapsed" "$(code)"
+
+status -H "authorization: Bearer not-a-real-token" "$BASE/v1/friends" > /dev/null
+want "an unknown token still says reactivate" "reactivate" "$(code)"
+
+# Releasing a seat is cleanup, not access, so it keeps working through a lapse: the seat cap would
+# otherwise be a trap.
+want "release still works while lapsed"       "200" \
+  "$(status -X POST -H "authorization: Bearer $PHONE_TOKEN" "$BASE/v1/devices/release")"
+
+# A borrowed activation must never REFRESH the licence row. If it did, a phone could keep a lapsed
+# licence alive forever on the strength of a code minted while it was still good, which is exactly
+# why the link branch skips the upsert rather than sharing it.
+want "a link code cannot revive a lapse"      "403" "$(activate "$json2")"
+want "and it says the subscription is needed" "subscription_required" "$(code)"
+want "the licence is still lapsed after that" "401" "$(status "${A[@]}" -o /dev/null "$BASE/v1/friends")"
+
+d1 "UPDATE licenses SET entitled_until = NULL WHERE license_hash = '$LICENSE';"
+want "and the licence recovers"               "200" "$(status "${A[@]}" -o /dev/null "$BASE/v1/friends")"
+d1 "DELETE FROM devices WHERE name = 'Phone';"
+d1 "DELETE FROM identities WHERE public_key = '$PHONE_KEY';"
+
+echo
 echo "apns key parsing (pure, no server)"
 
 # `apnsPEM` is the whole reason push can fail with the alarm reporting Ok: a mangled .p8 threw

@@ -322,7 +322,8 @@ import { APPSTORE_BUNDLE_ID, APPLE_ROOT_CA_G3, APPLE_ROOT_CA_G2 } from "../worke
 // two workers gate different features on one membership, so a rule that differs by a character
 // between them means a subscriber keeps one and loses the other.
 import { LICENSE_RECHECK_SECONDS, appStoreEntitlement, verifyAppSubscription,
-         entitlementMisconfigured }
+         entitlementMisconfigured,
+         SETAPP_RECHECK_SECONDS, setappMisconfigured, verifySetappAccess }
   from "../worker-shared/entitlement.js";
 
 // The JWS is three base64url segments and a signature; a real one is a few KB. Bounded so a
@@ -334,6 +335,42 @@ const MAX_APP_TRANSACTION_CHARS = 12000;
 // group member, so a Family Sharing member gets their own three seats rather than fighting
 // over the purchaser's.
 const appStoreHash = (appTransactionID) => sha256Hex(`appstore:${appTransactionID}`);
+
+// The third identity space, namespaced away from the other two for the same reason. Setapp's user
+// id is per ACCOUNT, and Setapp itself decides how many Macs that account may run the app on, so
+// this row's seats are a backstop rather than the enforcement.
+//
+// The input is `setappUserID`'s canonical decimal string and must never be anything else: this
+// hash is what every Setapp user's Friends identity is bound to, so a second spelling of the same
+// id is a second person as far as the first-claim guard is concerned.
+const setappHash = (userID) => sha256Hex(`setapp:${userID}`);
+
+// MARK: Link codes
+//
+// A one-time code a Mac mints for a phone. It exists because a Setapp Mac has nothing to hand
+// over: its own credential is a 20-minute single-use auth code that only a Worker can exchange,
+// so "show the phone your licence key" has no equivalent.
+//
+// Stored as sha256, like a device token, so the table is useless to anyone who reads it. Deleted
+// on redemption, so a code works exactly once, and expired rows are swept lazily by whoever next
+// looks one up.
+const LINK_CODE_TTL_SECONDS = 10 * 60;
+
+/// Spend a code, returning the licence it was minted against, or null.
+///
+/// Delete-then-check: the DELETE is the claim, so two phones racing the same code cannot both be
+/// told yes. D1 gives us the deleted row back, which is what makes this one statement rather than
+/// a select and a delete with a window in between.
+async function redeemLinkCode(env, code) {
+  const row = await env.DB.prepare(
+    "DELETE FROM link_codes WHERE code_hash = ? RETURNING license_hash, expires_at"
+  ).bind(await sha256Hex(code)).first();
+  if (!row) return null;
+  // An expired code is spent by being looked at, which is deliberate: it is dead either way, and
+  // deleting it here is the sweep.
+  if (row.expires_at <= now()) return null;
+  return row;
+}
 
 /// How many Macs THIS licence row may keep, counted across every row that shares the sale.
 ///
@@ -541,12 +578,25 @@ async function credentialHash(env, { key, jws }) {
 async function migrateIdentity(env, identityID, oldHash, newHash, body, stamp) {
   const key = typeof body.migrate_license_key === "string" ? body.migrate_license_key.trim() : "";
   const jws = typeof body.migrate_app_transaction === "string" ? body.migrate_app_transaction.trim() : "";
-  // Exactly one, same rule as the primary credential, and bounded the same way.
-  if (!key === !jws) return false;
+  // At least one, and BOTH is allowed now. It used to be exactly one, which was right while only
+  // a crossgrading Mac migrated: it moved in a known direction and knew which proof it had left
+  // behind. A Mac moving to Setapp does not. Its Keychain may hold a Gumroad key AND an App Store
+  // transaction, either of which may be the hash that actually claimed the identity, and it has no
+  // way to tell which: the answer lives on the server. So it sends what it has and each is TRIED.
+  //
+  // This proves possession and nothing else. Neither proof grants anything on its own: the only
+  // thing that can happen below is that an identity moves to a hash the caller has ALREADY
+  // authenticated as, and only if one of these resolves to the hash that owns it today.
+  if (!key && !jws) return false;
   if (key && key.length > 100) return false;
   if (jws && jws.length > MAX_APP_TRANSACTION_CHARS) return false;
 
-  const provenHash = await credentialHash(env, { key, jws });
+  // The key first, then the transaction, and the ORDER is arbitrary because the test is equality
+  // with `oldHash`: a proof that resolves to a different hash simply is not the one we want.
+  let provenHash = key ? await credentialHash(env, { key, jws: "" }) : null;
+  if (provenHash !== oldHash && jws) {
+    provenHash = await credentialHash(env, { key: "", jws });
+  }
   if (!provenHash || provenHash !== oldHash) return false;
 
   // Guarded on the old value, so two Macs racing the same migration cannot interleave into a
@@ -605,7 +655,7 @@ async function authenticate(request, env, ctx, opts) {
 /// entitlement clause landed in front of every /v1/ route, so a lapsed member got 401 on the one
 /// call that hands their seat back. The seat then stayed occupied until LRU eviction, which turns
 /// the seat cap into a trap. Same exemption, same reasoning, as files-worker's `authenticate`.
-async function authenticateToken(token, env, ctx, { allowExpired = false } = {}) {
+async function authenticateToken(token, env, ctx, { allowExpired = false, touch = true } = {}) {
   if (!token) return null;
   const tokenHash = await sha256Hex(token);
 
@@ -631,11 +681,36 @@ async function authenticateToken(token, env, ctx, { allowExpired = false } = {})
   // is Gumroad's word (refund, chargeback); blocked is ours (abuse).
   if (row.status !== "active") return null;
 
-  ctx.waitUntil(
-    env.DB.prepare("UPDATE devices SET last_seen_at = ? WHERE id = ?")
-      .bind(now(), row.device_id).run()
-  );
+  // NOT when the caller is only asking WHY a request failed (`refusal`). `last_seen_at` is what
+  // the seat eviction orders by, so bumping it for a request we are about to 401 let a lapsed or
+  // link-paired device that keeps polling sit permanently at the top of the LRU and evict a
+  // healthy but quieter Mac. It also spent a D1 write per refused request, and a client stuck
+  // past its horizon 401s on every call it makes.
+  if (touch) {
+    ctx.waitUntil(
+      env.DB.prepare("UPDATE devices SET last_seen_at = ? WHERE id = ?")
+        .bind(now(), row.device_id).run()
+    );
+  }
   return { deviceID: row.device_id, identityID: row.identity_id, licenseHash: row.license_hash };
+}
+
+/// The 401 to send, once `authenticate` has already said no.
+///
+/// Two different refusals wear this status. An unknown or revoked token means "activate again",
+/// which is what every client has always done. A LIVE token whose licence is merely past its
+/// horizon means "somebody needs to re-prove this licence", and for a phone that somebody is not
+/// itself: it holds a one-time link code that was spent on the day it paired, so throwing its
+/// token away to re-activate with nothing would end its Friends access permanently.
+///
+/// Costs one extra read, and only on a path that has already failed. `touch: false` because this
+/// request is being refused: recording it as activity would keep a device that only ever 401s at
+/// the head of the eviction LRU. Clients too old to know the name read any 401 as `reactivate`,
+/// which is exactly the old behaviour.
+async function refusal(token, env, ctx) {
+  if (!token) return fail(401, "reactivate");
+  const stillValid = await authenticateToken(token, env, ctx, { allowExpired: true, touch: false });
+  return stillValid ? fail(401, "entitlement_lapsed") : fail(401, "reactivate");
 }
 
 // ---------------------------------------------------------------- routes
@@ -663,8 +738,21 @@ async function activateDevice(request, env) {
   // would drag every redeeming Mac through the migration path on every activation and move its
   // friendships to a different licence.
   const redeemKey = typeof body.redeem_license_key === "string" ? body.redeem_license_key.trim() : "";
-  if (!key === !jws) return fail(400, "bad_request");
+  // The Setapp build's proof: a single-use authorization code, exchanged with Setapp's Vendor API
+  // below. A CREDENTIAL, unlike the two proofs above, because the licence hash is derived from
+  // what it resolves to.
+  const setappCode = typeof body.setapp_code === "string" ? body.setapp_code.trim() : "";
+  // A one-time code a Mac minted for a phone (`POST /v1/link`). Also a credential, but a borrowed
+  // one: it resolves to a licence hash somebody else already proved, so it verifies nothing with
+  // any vendor and can never CREATE a licence row.
+  const linkCode = typeof body.link_code === "string" ? body.link_code.trim() : "";
+  // Exactly one of the four. `!key === !jws` said this for two and stops scaling at three: with
+  // four credentials the question is a count, and silently picking a winner is how one build ends
+  // up authenticating as somebody else's licence.
+  if ([key, jws, setappCode, linkCode].filter(Boolean).length !== 1) return fail(400, "bad_request");
   if (key && key.length > 100) return fail(400, "bad_request");
+  if (setappCode && setappCode.length > 512) return fail(400, "bad_request");
+  if (linkCode && linkCode.length > 128) return fail(400, "bad_request");
   if (jws && jws.length > MAX_APP_TRANSACTION_CHARS) return fail(400, "bad_request");
   if (subJWS && subJWS.length > MAX_APP_TRANSACTION_CHARS) return fail(400, "bad_request");
   if (redeemKey && redeemKey.length > 100) return fail(400, "bad_request");
@@ -677,10 +765,15 @@ async function activateDevice(request, env) {
   // NULL means entitled forever, and it is the default for a reason: every path that does not
   // deliberately set a horizon is a grandfathered one.
   let entitledUntil = null;
-  // How many Macs THIS row may keep once it is written. BOTH credential branches lower it, so
-  // that one membership sale means five devices in total rather than five per Apple Account:
-  // see `saleSeatBudget` and the eviction that spends this budget.
+  // How many Macs THIS row may keep once it is written. Every branch that can ADD a device lowers
+  // it, so that one membership sale means five devices in total rather than five per Apple
+  // Account: see `saleSeatBudget` and the eviction that spends this budget. The one exception is
+  // Setapp, which counts devices itself, per purchase, and says so where it skips the call.
   let deviceBudget = MAX_DEVICES_PER_LICENSE;
+  // Whether this activation is riding a licence somebody else proved (a phone spending a link
+  // code). A borrowed activation may add a device, but must never write the `licenses` row: see
+  // the link branch below and the upsert it skips.
+  let borrowed = false;
 
   // BEFORE either credential branch, because the hazard is what gets WRITTEN below rather than
   // which door it came through. Both entitlement rules answer NULL when the cutover is missing,
@@ -752,6 +845,69 @@ async function activateDevice(request, env) {
     // Store Server Notifications V2 and a webhook, and §14 says fail open and do not build
     // DRM until piracy is a real problem. `blocked` below still works, because that is our
     // own abuse decision and applies to either channel.
+  } else if (setappCode) {
+    // Setapp, verified inline and forgotten. The code is exchanged for an access token, the token
+    // answers two questions, and neither the token nor its refresh token is stored: the next check
+    // happens because `entitled_until` expires and the client activates again with a code it
+    // fetched a moment earlier. No cron, no token table, no refresh rotation.
+    //
+    // Before the misconfiguration check has a chance to matter, `setappMisconfigured` answers for
+    // this branch what `entitlementMisconfigured` answers for the App Store one: a deploy that
+    // cannot ask Setapp must say so, not mint a permanent grandfathered row.
+    if (setappMisconfigured(env)) return fail(503, "setapp_unconfigured");
+    const { status, userID } = await verifySetappAccess(setappCode, env);
+    // Same fail-closed reasoning as the Gumroad branch: an already-issued token keeps working
+    // while Setapp is unreachable, but handing out a NEW one without an answer would make "the
+    // vendor is down" a free pass.
+    if (status === "unreachable") return fail(503, "setapp_down");
+    // A code that is expired, already spent, or not ours. Not latched by the client: a fresh code
+    // is one launch away, and the commonest cause is simply a slow hand between the two Workers.
+    if (status === "invalid") return fail(403, "bad_license");
+    // Setapp's own answer to "may this person use the app". Their launch agent normally stops a
+    // lapsed subscriber before this, so in practice this is a subscription that ended between
+    // launch and now.
+    if (status === "refused") return fail(403, "subscription_required");
+
+    hash = await setappHash(userID);
+    source = "setapp";
+    // NEVER null, unlike the grandfathered branches. A null horizon is permanent (the upsert's
+    // CASE pins it), and a Setapp subscription that can be cancelled tomorrow must never be
+    // written as entitled forever.
+    entitledUntil = stamp + SETAPP_RECHECK_SECONDS;
+    // No `saleSeatBudget`: Setapp counts devices itself, per purchase, and the user picks how
+    // many at checkout. The per-hash LRU below still applies as a backstop.
+  } else if (linkCode) {
+    // A phone joining a licence its Mac already proved.
+    //
+    // This branch verifies NOTHING with any vendor, because it has nothing to verify: the code is
+    // the Worker's own word, minted at `POST /v1/link` for a device that had already authenticated.
+    // What it must therefore never do is CREATE or REFRESH a licence: it reads the row, refuses if
+    // that row is in no state to take another device, and leaves `entitled_until` exactly as it
+    // found it. Extending a horizon here would mean a phone could keep a lapsed licence alive
+    // forever on the strength of a code minted while it was still good.
+    const redeemed = await redeemLinkCode(env, linkCode);
+    if (!redeemed) return fail(403, "bad_license");
+    hash = redeemed.license_hash;
+    borrowed = true;
+
+    const row = await env.DB.prepare(
+      "SELECT status, entitled_until, gumroad_sale_id FROM licenses WHERE license_hash = ?"
+    ).bind(hash).first();
+    if (!row) return fail(403, "bad_license");
+    if (row.status !== "active") return fail(403, "revoked");
+    if (row.entitled_until !== null && row.entitled_until <= stamp) {
+      return fail(403, "subscription_required");
+    }
+    // The SALE's budget, exactly as the two credential branches apply it. This branch is not
+    // Setapp-only: `POST /v1/link` is open to any authenticated device, so a link redemption on a
+    // Gumroad membership went through here keeping the full `MAX_DEVICES_PER_LICENSE` while the
+    // sale's other hashes had already spent most of it, and the eviction below, which is scoped
+    // to `license_hash` alone, could not see the difference. A borrowed activation adds a device
+    // and so must spend a seat like any other; what it must not do is WRITE the licence row,
+    // which is what `borrowed` still governs.
+    const budget = await saleSeatBudget(env, row.gumroad_sale_id, hash);
+    if (budget === null) return fail(403, "seat_limit");
+    deviceBudget = budget;
   } else {
     const { status: verdict, saleID: gumroadSaleID, entitledUntil: until } = await verifyLicense(key, env);
     // FAIL CLOSED here, and only here. The app's own license gate fails OPEN by design
@@ -823,18 +979,27 @@ async function activateDevice(request, env) {
   // transiently omits `subscription_id`. Every row that existed when the migration ran is NULL,
   // so every user who had ever activated is grandfathered with no backfill and no date
   // arithmetic at all.
-  await env.DB.prepare(
-    "INSERT INTO licenses (license_hash, status, checked_at, created_at, gumroad_sale_id, source, entitled_until) " +
-    "VALUES (?, 'active', ?, ?, ?, ?, ?) " +
-    "ON CONFLICT(license_hash) DO UPDATE SET " +
-    "status = CASE WHEN licenses.status = 'blocked' THEN 'blocked' ELSE 'active' END, " +
-    "checked_at = excluded.checked_at, " +
-    "gumroad_sale_id = COALESCE(excluded.gumroad_sale_id, licenses.gumroad_sale_id), " +
-    "entitled_until = CASE " +
-    "WHEN licenses.entitled_until IS NULL THEN NULL " +
-    "WHEN excluded.entitled_until IS NULL THEN licenses.entitled_until " +
-    "ELSE excluded.entitled_until END"
-  ).bind(hash, stamp, stamp, saleID, source, entitledUntil).run();
+  //
+  // SKIPPED ENTIRELY for a borrowed activation. A phone spending a link code proved nothing to
+  // anybody: it presented a code this Worker minted for a device that had already authenticated.
+  // Running the upsert on its behalf would stamp `checked_at` as though a vendor had just been
+  // asked, and worse, would carry `entitledUntil` (null for a borrowed activation) into a row
+  // whose horizon is real. The link branch above has already read the row and refused if it was
+  // in no state to take another device.
+  if (!borrowed) {
+    await env.DB.prepare(
+      "INSERT INTO licenses (license_hash, status, checked_at, created_at, gumroad_sale_id, source, entitled_until) " +
+      "VALUES (?, 'active', ?, ?, ?, ?, ?) " +
+      "ON CONFLICT(license_hash) DO UPDATE SET " +
+      "status = CASE WHEN licenses.status = 'blocked' THEN 'blocked' ELSE 'active' END, " +
+      "checked_at = excluded.checked_at, " +
+      "gumroad_sale_id = COALESCE(excluded.gumroad_sale_id, licenses.gumroad_sale_id), " +
+      "entitled_until = CASE " +
+      "WHEN licenses.entitled_until IS NULL THEN NULL " +
+      "WHEN excluded.entitled_until IS NULL THEN licenses.entitled_until " +
+      "ELSE excluded.entitled_until END"
+    ).bind(hash, stamp, stamp, saleID, source, entitledUntil).run();
+  }
 
   const blocked = await env.DB.prepare("SELECT status FROM licenses WHERE license_hash = ?")
     .bind(hash).first();
@@ -1020,6 +1185,26 @@ async function revokeDevice(request, env, auth) {
 
 // ---------------------------------------------------------------- invites
 
+/// Mint a one-time code that lets a phone join THIS licence.
+///
+/// Authed, so the caller has already proved the licence: this is the Worker vouching for that to a
+/// second device, which is the whole reason a Setapp Mac can pair a phone at all. The code is a
+/// bearer secret for its ten minutes, so it is stored hashed and returned exactly once, and the
+/// display side (`PairPhoneView`) never persists or logs it.
+///
+/// Deliberately not rate limited beyond the general gate: minting is cheap, the code dies quickly,
+/// and a user who scans badly and taps again should not be told to wait.
+async function createLink(env, auth) {
+  const stamp = now();
+  // Same shape and entropy as a device token, and for the same reason: it is a bearer credential
+  // for as long as it lives.
+  const code = randomToken();
+  await env.DB.prepare(
+    "INSERT INTO link_codes (code_hash, license_hash, expires_at, created_at) VALUES (?,?,?,?)"
+  ).bind(await sha256Hex(code), auth.licenseHash, stamp + LINK_CODE_TTL_SECONDS, stamp).run();
+  return reply(201, { code, expires_in: LINK_CODE_TTL_SECONDS });
+}
+
 async function createInvite(env, auth) {
   const stamp = now();
   const since = stamp - 86400;
@@ -1157,11 +1342,24 @@ const registerPush = async (request, env, auth) => {
     return fail(400, "bad_request");
   }
   const environment = body.environment === "sandbox" ? "sandbox" : "production";
+  // ALLOWLISTED, never taken as given. The topic goes out as an APNs header, and our .p8 signs
+  // for this bundle id and its Setapp twin only, so an arbitrary string could at best waste a
+  // request and at worst let a client aim our push credentials at a topic we did not choose.
+  // Anything unrecognised is dropped rather than refused: an older or newer client sending
+  // something else still gets working push, on the deployment default.
+  const topic = PUSH_TOPICS.includes(body.topic) ? body.topic : null;
   const response = await inboxCall(env, auth.identityID, "/push/register", {
-    device: auth.deviceID, token: body.token.toLowerCase(), environment,
+    device: auth.deviceID, token: body.token.toLowerCase(), environment, topic,
   });
   return response.ok ? reply(200, {}) : fail(503, "try_again");
 };
+
+/// Every bundle id this deployment's APNs key may address.
+///
+/// Two, because the Setapp build cannot share the others' id: Setapp requires the `-setapp`
+/// suffix and it can never be changed. `APNS_TOPIC` overrides the DEFAULT for tokens that carry
+/// no topic of their own; this list is what a client is allowed to ask for.
+const PUSH_TOPICS = ["com.qubit.shroomy.app", "com.qubit.shroomy.app-setapp"];
 
 // ---------------------------------------------------------------- APNs
 //
@@ -1258,13 +1456,18 @@ async function mintAPNsToken(env) {
 /// The payload carries NO content and no names, because the server holds neither.
 /// `loc-key` resolves against the app bundle, so the alert is localized on the Mac from the
 /// catalogs that are already there and nothing readable crosses Apple's servers.
-async function sendPush(env, jwt, token, environment, threadID) {
+async function sendPush(env, jwt, token, environment, threadID, topic) {
   const host = environment === "sandbox" ? "api.sandbox.push.apple.com" : "api.push.apple.com";
   return fetch(`https://${host}/3/device/${token}`, {
     method: "POST",
     headers: {
       authorization: `bearer ${jwt}`,
-      "apns-topic": env.APNS_TOPIC ?? "com.qubit.shroomy.app",
+      // PER DEVICE, because the topic must equal the bundle id the token was issued to and there
+      // is more than one bundle id now: the Setapp build ships `com.qubit.shroomy.app-setapp`,
+      // permanently, because Setapp requires the suffix. Sending one hardcoded topic to a Setapp
+      // Mac's token gets a 400 from Apple and no banner, with nothing in any log here to say why.
+      // The env var stays as the fallback for tokens registered before clients sent a topic.
+      "apns-topic": topic ?? env.APNS_TOPIC ?? "com.qubit.shroomy.app",
       "apns-push-type": "alert",
       "apns-priority": "10",
       // EXPLICIT, because the header's absence means 0, and 0 means "try once and do not
@@ -1335,6 +1538,9 @@ export class UserInbox {
     for (const alter of [
       "ALTER TABLE friends ADD COLUMN online_at INTEGER",
       "ALTER TABLE devices ADD COLUMN last_pushed_seq INTEGER NOT NULL DEFAULT 0",
+      // NULL for every row that registered before clients sent one, which `sendPush` reads as
+      // "use the deployment default": the old behaviour, for the builds that had it.
+      "ALTER TABLE devices ADD COLUMN apns_topic TEXT",
     ]) {
       try { this.sql.exec(alter); } catch { /* already has it */ }
     }
@@ -1636,7 +1842,7 @@ export class UserInbox {
     return reply(200, {});
   }
 
-  savePushToken({ device, token, environment }) {
+  savePushToken({ device, token, environment, topic }) {
     if (!device) return fail(400, "bad_request");
     // A deployment that cannot push has no business holding a push token. Only our own .p8
     // signs for com.qubit.shroomy.app, so on anyone else's server this token is a stable
@@ -1647,10 +1853,11 @@ export class UserInbox {
     // nothing for it to retry.
     if (!apnsConfigured(this.env)) return reply(200, {});
     this.sql.exec(
-      "INSERT INTO devices (device_id, apns_token, apns_env, updated_at) VALUES (?,?,?,?) " +
+      "INSERT INTO devices (device_id, apns_token, apns_env, apns_topic, updated_at) VALUES (?,?,?,?,?) " +
       "ON CONFLICT(device_id) DO UPDATE SET apns_token = excluded.apns_token, " +
-      "apns_env = excluded.apns_env, updated_at = excluded.updated_at",
-      device, token, environment, now());
+      "apns_env = excluded.apns_env, apns_topic = excluded.apns_topic, " +
+      "updated_at = excluded.updated_at",
+      device, token, environment, topic ?? null, now());
     return reply(200, {});
   }
 
@@ -2012,7 +2219,7 @@ export class UserInbox {
     // notification would say exactly the same thing as the first.
     const newest = this.one("SELECT peer FROM messages WHERE seq = ?", latest);
     let targets = this.rows(
-      "SELECT device_id, apns_token, apns_env FROM devices " +
+      "SELECT device_id, apns_token, apns_env, apns_topic FROM devices " +
       "WHERE apns_token IS NOT NULL AND last_acked_seq < ? AND last_pushed_seq < ?",
       latest, latest);
     // The SAME entitlement clause as `authenticate`, `authenticateToken` and `stillAuthorized`.
@@ -2062,7 +2269,7 @@ export class UserInbox {
     for (const target of targets) {
       try {
         const response = await sendPush(this.env, jwt, target.apns_token, target.apns_env,
-                                        newest?.peer ?? "mushroom");
+                                        newest?.peer ?? "mushroom", target.apns_topic);
         // Device id, environment and status only. Never the token: it is a credential, and
         // this file's logging rule is ids and status codes.
         console.log(`push ${target.device_id} env=${target.apns_env} -> ${response.status}`);
@@ -2224,8 +2431,9 @@ export default {
     if (path === "/v1/connect") {
       const header = request.headers.get("authorization") ?? "";
       const bearer = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
-      const auth = await authenticateToken(bearer || (url.searchParams.get("token") ?? ""), env, ctx);
-      if (!auth) return fail(401, "reactivate");
+      const socketToken = bearer || (url.searchParams.get("token") ?? "");
+      const auth = await authenticateToken(socketToken, env, ctx);
+      if (!auth) return refusal(socketToken, env, ctx);
       const target = new URL("https://inbox/connect");
       target.searchParams.set("device", auth.deviceID);
       target.searchParams.set("presence", url.searchParams.get("presence") === "0" ? "0" : "1");
@@ -2244,13 +2452,17 @@ export default {
       // is exactly what used to 401 it.
       const releasing = path === "/v1/devices/release" && method === "POST";
       const auth = await authenticate(request, env, ctx, { allowExpired: releasing });
-      if (!auth) return fail(401, "reactivate");
+      if (!auth) {
+        const header = request.headers.get("authorization") ?? "";
+        return refusal(header.startsWith("Bearer ") ? header.slice(7).trim() : "", env, ctx);
+      }
 
       if (releasing) return releaseDevice(env, auth);
       if (path === "/v1/devices" && method === "GET") return listDevices(env, auth);
       if (path === "/v1/devices/revoke" && method === "POST") {
         return revokeDevice(request, env, auth);
       }
+      if (path === "/v1/link" && method === "POST") return createLink(env, auth);
       if (path === "/v1/invites" && method === "POST") return createInvite(env, auth);
       if (path === "/v1/invites/accept" && method === "POST") return acceptInvite(request, env, auth);
       if (path === "/v1/sync" && method === "GET") return syncMessages(env, auth, url);
@@ -2282,6 +2494,10 @@ export default {
       await env.DB.prepare(
         "DELETE FROM devices WHERE revoked_at IS NOT NULL AND revoked_at < ?"
       ).bind(now() - 30 * 86400).run();
+      // Link codes die in ten minutes and redemption deletes them, so this only ever collects the
+      // ones nobody scanned. An hour of slack so a clock skew cannot delete a live code.
+      await env.DB.prepare("DELETE FROM link_codes WHERE expires_at < ?")
+        .bind(now() - 3600).run();
     })());
   },
 };

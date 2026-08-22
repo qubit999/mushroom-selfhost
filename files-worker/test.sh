@@ -404,6 +404,29 @@ want "activate with an array body is 400"      400 \
 want "forged but well-formed JWS is 403"       403 \
   "$(status -X POST -H 'content-type: application/json' -d "{\"app_transaction\":\"aaa.bbb.ccc\"}" "$BASE/v1/devices/activate")"
 
+# The Setapp branch ships BEFORE Setapp is configured, and these are the proof it is inert: with
+# no SETAPP_CLIENT_ID/SECRET set every setapp activation answers 503 `setapp_unconfigured`, the
+# soft code neither client latches. Must agree with mushroom-messaging's copy of this block, or a
+# Setapp subscriber keeps one hosted feature and loses the other.
+#
+# The JSON is assembled with SINGLE quotes around the braces. Bash brace-expands an unquoted
+# `{a,b}` into two words, and inside a `$(...)` the escaping is re-parsed, so the obvious spelling
+# sends a malformed body and every assertion here reads 400 for the wrong reason.
+setapp_json='{"setapp_code":"CODE","device_name":"t"}'
+want "setapp with no secrets is 503"           503 \
+  "$(status -X POST -H 'content-type: application/json' -d "$setapp_json" "$BASE/v1/devices/activate")"
+want "and it says setapp_unconfigured"         "setapp_unconfigured" \
+  "$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("code",""))' < /tmp/mf-body 2>/dev/null)"
+
+# Exactly one of the three, counted rather than compared: picking a winner silently is how one
+# build ends up authenticating as another's licence.
+both_json='{"setapp_code":"C","license_key":"K","device_name":"t"}'
+want "setapp plus a key is 400"                400 \
+  "$(status -X POST -H 'content-type: application/json' -d "$both_json" "$BASE/v1/devices/activate")"
+big_json='{"setapp_code":"'"$(head -c 600 /dev/zero | tr '\0' 'x')"'","device_name":"t"}'
+want "oversize setapp_code is 400"             400 \
+  "$(status -X POST -H 'content-type: application/json' -d "$big_json" "$BASE/v1/devices/activate")"
+
 echo
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

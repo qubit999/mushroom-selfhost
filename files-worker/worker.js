@@ -314,7 +314,8 @@ import { APPSTORE_BUNDLE_ID, APPLE_ROOT_CA_G3, APPLE_ROOT_CA_G2 } from "../worke
 // two workers gate different features on one membership, so a rule that differs by a character
 // between them means a subscriber keeps one and loses the other.
 import { LICENSE_RECHECK_SECONDS, appStoreEntitlement, verifyAppSubscription,
-         entitlementMisconfigured }
+         entitlementMisconfigured,
+         SETAPP_RECHECK_SECONDS, setappMisconfigured, verifySetappAccess }
   from "../worker-shared/entitlement.js";
 
 // The JWS is three base64url segments and a signature; a real one is a few KB. Bounded so a
@@ -326,6 +327,14 @@ const MAX_APP_TRANSACTION_CHARS = 12000;
 // group member, so a Family Sharing member gets their own three seats rather than fighting
 // over the purchaser's.
 const appStoreHash = (appTransactionID) => sha256Hex(`appstore:${appTransactionID}`);
+
+// The third identity space. Namespaced away from the other two for the same reason, and computed
+// from `setappUserID`'s canonical decimal string so one account can never hash two ways.
+//
+// Must match messaging-worker's copy EXACTLY: a Setapp subscriber whose two Workers disagreed
+// about their licence hash would keep one hosted feature and lose the other, which is the drift
+// worker-shared/entitlement.js exists to prevent.
+const setappHash = (userID) => sha256Hex(`setapp:${userID}`);
 
 /// How many Macs THIS licence row may keep, counted across every row that shares the sale.
 ///
@@ -515,7 +524,7 @@ async function throttle(env, name, key, limit, windowSeconds) {
 /// got 401 on the one call that hands their seat back: `switchServers` could not release, and the
 /// seat stayed occupied until LRU eviction. Cleanup has to keep working after the horizon passes,
 /// or the seat cap becomes a trap.
-async function authenticate(request, env, ctx, { allowExpired = false } = {}) {
+async function authenticate(request, env, ctx, { allowExpired = false, touch = true } = {}) {
   const header = request.headers.get("authorization") ?? "";
   if (!header.startsWith("Bearer ")) return null;
   const tokenHash = await sha256Hex(header.slice(7).trim());
@@ -541,14 +550,35 @@ async function authenticate(request, env, ctx, { allowExpired = false } = {}) {
   ).bind(...(allowExpired ? [tokenHash] : [tokenHash, now()])).first();
   if (!row) return null;
 
-  ctx.waitUntil(
-    env.DB.prepare("UPDATE devices SET last_seen_at = ? WHERE id = ?").bind(now(), row.device_id).run()
-  );
+  // NOT when the caller is only asking WHY a request failed (`refusal`). `last_seen_at` is what
+  // the seat eviction orders by, so bumping it for a request we are about to 401 let a device
+  // that only ever 401s sit permanently at the top of the LRU and evict a healthy but quieter
+  // Mac, and it spent a D1 write per refused request on top of the read.
+  if (touch) {
+    ctx.waitUntil(
+      env.DB.prepare("UPDATE devices SET last_seen_at = ? WHERE id = ?").bind(now(), row.device_id).run()
+    );
+  }
   // Same shape the two queries returned, minus `checked_at`, which no caller reads.
   return {
     device: { id: row.device_id, license_hash: row.license_hash },
     license: { license_hash: row.license_hash, status: row.status },
   };
+}
+
+/// The 401 to send, once `authenticate` has already said no.
+///
+/// Two different refusals wear this status: an unknown or revoked token ("activate again"), and a
+/// LIVE token whose licence is merely past its horizon ("somebody has to re-prove this licence").
+/// The Mac can always do the second itself, so the distinction changes nothing here today; it is
+/// sent because the two Workers answer the same vocabulary, and `FileShare.classify` reads it.
+/// Costs one extra read, only on a path that has already failed. `touch: false` because this
+/// request is being refused: recording it as activity would keep a device that only ever 401s at
+/// the head of the eviction LRU. Older clients read any 401 as `reactivate`, which is the old
+/// behaviour exactly. Mirrors mushroom-messaging's `refusal`.
+async function refusal(request, env, ctx) {
+  const stillValid = await authenticate(request, env, ctx, { allowExpired: true, touch: false });
+  return stillValid ? fail(401, "entitlement_lapsed") : fail(401, "reactivate");
 }
 
 // ---------------------------------------------------------------- routes
@@ -576,7 +606,16 @@ async function activateDevice(request, env) {
   // would drag every redeeming Mac through the migration path on every activation and move its
   // friendships to a different licence.
   const redeemKey = typeof body.redeem_license_key === "string" ? body.redeem_license_key.trim() : "";
-  if (!key === !jws) return fail(400, "bad_request");
+  // The Setapp build's proof: a single-use authorization code, exchanged with Setapp's Vendor API
+  // below. A CREDENTIAL, unlike the two proofs above, because the licence hash comes from it.
+  //
+  // No `link_code` here, unlike mushroom-messaging. That one exists so a PHONE can join a licence,
+  // and the phone has no Spore Storage: there is no FileShareClient in the iOS target, so a code
+  // minted here would be carried and expired with nothing able to redeem it.
+  const setappCode = typeof body.setapp_code === "string" ? body.setapp_code.trim() : "";
+  // Exactly one of the three. `!key === !jws` said this for two and does not scale.
+  if ([key, jws, setappCode].filter(Boolean).length !== 1) return fail(400, "bad_request");
+  if (setappCode && setappCode.length > 512) return fail(400, "bad_request");
   if (key && key.length > 100) return fail(400, "bad_request");
   if (jws && jws.length > MAX_APP_TRANSACTION_CHARS) return fail(400, "bad_request");
   if (subJWS && subJWS.length > MAX_APP_TRANSACTION_CHARS) return fail(400, "bad_request");
@@ -661,6 +700,25 @@ async function activateDevice(request, env) {
     // No revoked branch: an Apple refund is not visible from here. Catching one needs App
     // Store Server Notifications V2 and a webhook, and §14 says fail open and do not build
     // DRM until piracy is a real problem. The quotas bound the damage either way.
+  } else if (setappCode) {
+    // Setapp, verified inline and forgotten: the code is exchanged, the answer is written as a
+    // horizon, and no token is stored. The next check happens because that horizon expires and the
+    // client activates again with a code it fetched a moment earlier. See the twin branch in
+    // mushroom-messaging, which this must keep agreeing with.
+    if (setappMisconfigured(env)) return fail(503, "setapp_unconfigured");
+    const { status, userID } = await verifySetappAccess(setappCode, env);
+    // Same fail-closed rule as the Gumroad branch below: an issued token keeps working while the
+    // vendor is unreachable, but a NEW one is not handed out on a shrug.
+    if (status === "unreachable") return fail(503, "setapp_down");
+    if (status === "invalid") return fail(403, "bad_license");
+    if (status === "refused") return fail(403, "subscription_required");
+
+    hash = await setappHash(userID);
+    source = "setapp";
+    // NEVER null: a null horizon is permanent (the upsert's CASE pins it), and a subscription
+    // that can be cancelled tomorrow must never be written as entitled forever.
+    entitledUntil = stamp + SETAPP_RECHECK_SECONDS;
+    // No seat budget lowering: Setapp counts devices itself, per purchase.
   } else {
     const { status: verdict, saleID: gumroadSaleID, entitledUntil: until } = await verifyLicense(key, env);
     // FAIL CLOSED here, and only here. The app's own licence gate fails OPEN by design
@@ -1697,7 +1755,7 @@ export default {
       // exactly what used to 401 it.
       const releasing = path === "/v1/devices/release" && method === "POST";
       const auth = await authenticate(request, env, ctx, { allowExpired: releasing });
-      if (!auth) return fail(401, "reactivate");
+      if (!auth) return refusal(request, env, ctx);
 
       if (releasing) return releaseDevice(env, auth);
       if (path === "/v1/files" && method === "POST") return createFile(request, env, auth);
