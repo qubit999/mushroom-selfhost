@@ -4,18 +4,16 @@
 // public trust anchors. They are NOT covered by this project's Apache-2.0 licence and no licence
 // over them is granted or claimed. See the NOTICE file. Everything else in this file is ours.
 //
-// ONE copy on purpose, imported by both mushroom-files and mushroom-messaging. The
-// verification LOGIC is duplicated between the two workers, matching how `verifyLicense` and
-// `sha256Hex` already live in both, but these are cryptographic trust anchors: they have to
-// be rotated in lockstep, and neither worker's test.sh would notice a one-sided edit.
+// One copy, imported by both mushroom-files and mushroom-messaging. These are trust anchors:
+// they must rotate in lockstep, and neither worker's test.sh would notice a one-sided edit.
 //
-// Deliberately dependency-free, which is why a plain relative import works here with no
-// build step and no npm workspace: wrangler bundles `main` with esbuild, and a file that
-// imports nothing has no bare specifier to resolve from the wrong directory.
+// Dependency-free, so a plain relative import works with no build step or npm workspace:
+// wrangler bundles `main` with esbuild, and a file that imports nothing has no bare specifier
+// to resolve from the wrong directory.
 //
-// Public certificates, not secrets. PINNED rather than fetched at runtime: a verifier that
-// downloads its own trust anchor is not verifying anything. Both roots because Apple signs
-// against either. Source: https://www.apple.com/certificateauthority/
+// Public certificates, not secrets. Pinned, not fetched at runtime: a verifier that downloads
+// its own trust anchor verifies nothing. Both roots, because Apple signs against either.
+// Source: https://www.apple.com/certificateauthority/
 //
 // Never hand-edit these. Regenerate from the downloaded .cer with
 // `base64 -i AppleRootCA-G3.cer` and check the result decodes with

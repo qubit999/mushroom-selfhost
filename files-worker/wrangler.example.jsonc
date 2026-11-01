@@ -1,72 +1,66 @@
 // EXAMPLE. Copy to wrangler.jsonc and fill in your own values.
 //
-// The real wrangler.jsonc is not published: it carries the live database ids of our
-// hosted deployment. Every placeholder below is marked, and `wrangler d1 create` and
-// `wrangler r2 bucket create` print the values you need.
+// The real wrangler.jsonc isn't published: it carries our hosted deployment's database ids.
+// Placeholders are marked, and `wrangler d1 create` and `wrangler r2 bucket create` print the
+// values you need.
 //
-// This file is for running the Workers in YOUR OWN Cloudflare account (deploy/README.md).
-// Running them on your own hardware needs none of it: see selfhost/README.md.
+// This is for running the Workers in your own Cloudflare account (deploy/README.md). Running
+// them on your own hardware needs none of it: see selfhost/README.md.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "mushroom-files",
   "main": "worker.js",
   "compatibility_date": "2026-07-25",
 
-  // Required by the App Store activation path: @apple/app-store-server-library
-  // needs node builtins (Buffer, crypto). The import itself is deliberately inside the
-  // request handler, not at module scope, because jsrsasign generates randomness while
-  // its module body runs and workerd refuses that in global scope. See worker.js.
+  // App Store activation needs it: @apple/app-store-server-library uses node builtins
+  // (Buffer, crypto). The import is inside the request handler, not at module scope, because
+  // jsrsasign generates randomness in its module body and workerd refuses that in global
+  // scope. See worker.js.
   "compatibility_flags": ["nodejs_compat"],
 
-  // Deliberately NO "assets" block. The website worker (Mushroom_www) serves every
-  // repo-root file as a static asset and matches assets BEFORE code, so a file named
-  // like a route would silently shadow it. This worker is code only.
+  // No "assets" block, on purpose. The website worker (Mushroom_www) serves every repo-root
+  // file as a static asset and matches assets before code, so a file named like a route
+  // would silently shadow it. This worker is code only.
 
   "observability": { "enabled": true },
 
-  // NO "ratelimits" binding here, and that is a decision rather than an omission. The per-IP
-  // cap on /v1/devices/activate is a D1 counter in worker.js instead, because Cloudflare's
-  // own Rate Limiting binding was tried here first and measured not to enforce for this
-  // account: 139 requests from one IP inside a minute, against a configured 30 per 60
-  // seconds, every one of them answered `{"success":true}`. Verify with a burst against the
-  // deployed Worker before ever swapping it back.
+  // No "ratelimits" binding, on purpose. The per-IP cap on /v1/devices/activate is a D1 counter
+  // in worker.js, because Cloudflare's Rate Limiting binding didn't enforce on this account: 139
+  // requests from one IP in a minute against 30 per 60 seconds, all answered
+  // `{"success":true}`. Verify with a burst against the deployed Worker before swapping back.
 
   "vars": {
-    // The App Store build presents AppTransaction's JWS instead of a Gumroad key, and
-    // Apple's verifier needs the app's numeric App Store id to check it against the
-    // right app. Public, not a secret: it is the id in every App Store URL, which is why
-    // it sits here in version control rather than in a wrangler secret nobody can see.
+    // The App Store build presents AppTransaction's JWS instead of a Gumroad key, and Apple's
+    // verifier needs the numeric App Store id to check it against the right app. Public (it's in
+    // every App Store URL), so it lives in version control, not in a wrangler secret.
     "APPSTORE_APP_APPLE_ID": "6792833686",
     "PUBLIC_BASE": "https://files.getmushroom.app",
 
     // Optional. Space or comma separated App Store product ids for the Friends and Spore Storage
     // subscription, matching StoreEntitlement.productIDMonthly / .productIDYearly in the app.
-    // Empty (the default) means this deployment does not sell one, which is right for a
-    // self-hosted box: its ENTITLEMENT_CUTOVER is 0, so nothing ever asks for a subscription.
+    // Empty (the default) means this deployment sells none, right for a self-hosted box: its
+    // ENTITLEMENT_CUTOVER is 0, so nothing asks for a subscription.
     // "APPSTORE_SUBSCRIPTION_PRODUCT_IDS": "com.qubit.shroomy.app.membership.monthly com.qubit.shroomy.app.membership.yearly",
-    // Optional. Unix seconds. Purchases from BEFORE this instant keep Spore Storage forever;
-    // from after it, a live subscription is required. The code default is 0, which means
-    // grandfather everyone, and that is what a self-hosted box should keep: it makes an
-    // install that never expires and never asks Gumroad about a subscription.
+    // Optional. Unix seconds. Purchases before this instant keep Spore Storage forever; after it,
+    // a live subscription is required. The code default, 0, grandfathers everyone, which a
+    // self-hosted box should keep: an install that never expires or asks about a subscription.
     //
-    // MUST match mushroom-messaging's value. Two different cutovers means a subscriber keeps
-    // one feature and loses the other, which reads as a bug in whichever half broke.
+    // Must match mushroom-messaging's value, or a subscriber keeps one feature and loses the
+    // other.
     //
-    // Leaving it 0 is also how this deploys as a no-op on our own servers. Flip it only once a
-    // build that can actually sell a subscription is live and adopted, because until then a
-    // refused user has no way to buy their way back in.
+    // 0 also makes this a no-op deploy on our servers. Flip it only once a build that can sell a
+    // subscription is live and adopted; until then a refused user can't buy their way back in.
     // "ENTITLEMENT_CUTOVER": "0",
 
-    // Where the expired and removed pages link, and where the bare root redirects. Those two
-    // pages are the only thing this Worker ever shows a person who is not running Mushroom.
-    // Set it to "" and the deployment names nobody: the root answers 404 and the pages carry
-    // no link. Unset falls back to www.getmushroom.app, which is right for us and wrong for
-    // anybody else, so a deployment that is not ours should say something here.
+    // Where the expired and removed pages link, and where the bare root redirects: all this
+    // Worker ever shows someone not running Mushroom. "" names nobody (the root 404s, the pages
+    // carry no link). Unset falls back to www.getmushroom.app, right only for us, so anyone
+    // else should set something.
     "BRAND_URL": "https://www.getmushroom.app",
 
-    // Which origins may post to /v1/abuse-reports, comma separated. Only needed if you serve
-    // your own copy of report.html; unset means our two hostnames. The form also needs
-    // TURNSTILE_SECRET_KEY and an EMAIL binding before it does anything.
+    // Origins allowed to post to /v1/abuse-reports, comma separated. Only needed if you serve
+    // your own report.html; unset means our two hostnames. The form also needs
+    // TURNSTILE_SECRET_KEY and an EMAIL binding.
     // "REPORT_ORIGINS": "https://getmushroom.app,https://www.getmushroom.app"
   },
 
@@ -83,24 +77,21 @@
     {
       "binding": "FILES",
       "bucket_name": "your-bucket-name"
-      // Deliberately NO "jurisdiction". R2 Local Uploads, which is what makes an upload
-      // from outside Europe quick, is not supported on a bucket that has one. Jurisdiction
-      // is fixed at creation, so switching cost a whole new bucket and buys nothing back
-      // if it is re-added. The bucket carries a weur location hint instead: the data still
-      // sits in Western Europe, it is just no longer a guarantee. privacy.html says so.
+      // No "jurisdiction", on purpose: R2 Local Uploads, which makes uploads from outside
+      // Europe quick, isn't supported with one, and it's fixed at bucket creation. A weur
+      // location hint keeps the data in Western Europe, though not as a guarantee;
+      // privacy.html says so.
     }
   ],
 
-  // Abuse report notifications. Locked to the one destination it is ever allowed to
-  // reach: a bug or an injection in the report path then cannot turn this Worker into an
-  // open relay. The sender (abuse@getmushroom.app) needs no mailbox, only a domain
-  // onboarded to Email Sending.
+  // Abuse report notifications, locked to one destination so a bug or injection in the report
+  // path can't make this Worker an open relay. The sender (abuse@getmushroom.app) needs no
+  // mailbox, only a domain onboarded to Email Sending.
   "send_email": [
     { "name": "EMAIL", "destination_address": "you@example.com" }
   ],
 
-  // Hourly sweep. The minute is arbitrary and deliberately not :00, where every cron on
-  // the platform piles up.
+  // Hourly sweep. Any minute but :00, where every cron on the platform piles up.
   "triggers": { "crons": ["17 * * * *"] },
 
   "routes": [

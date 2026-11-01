@@ -2,16 +2,15 @@
 //
 //   "MSH1" (4) || nonce (12) || AES-GCM-256 ciphertext || tag (16)
 //
-// The Mac seals with CryptoKit (Sources/MushroomPetKit/SporeCrypto.swift) and the receive
-// page in worker.js opens with WebCrypto. A unit test on either side alone passes happily
-// while the two disagree about the layout, and the result of that is a link nobody can open,
-// so this file exists to make the two agree in public. The numbers below are the same ones in
-// SporeVector in Tests/MushroomPetKitTests/SporeCryptoTests.swift. Change them together or
-// not at all.
+// The Mac seals with CryptoKit (Sources/MushroomPetKit/SporeCrypto.swift) and the receive page
+// in worker.js opens with WebCrypto. Unit tests on each side pass even when the two disagree on
+// layout, leaving links nobody can open; this makes them agree in public. The numbers match
+// SporeVector in Tests/MushroomPetKitTests/SporeCryptoTests.swift. Change them together or not
+// at all.
 //
 //   node vector.mjs
 //
-// Run by test.sh, and standalone in a second.
+// Run by test.sh, or standalone in a second.
 
 const KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 const NONCE = new Uint8Array([0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5,
@@ -46,8 +45,8 @@ const opened = await crypto.subtle.decrypt(
 check("Swift's bytes open under WebCrypto",
       new TextDecoder().decode(opened) === PLAINTEXT);
 
-// And seal it back, to prove the agreement runs both ways: a page that could only read
-// would not catch WebCrypto and CryptoKit disagreeing about where the tag goes.
+// And seal it back, proving agreement both ways: reading alone wouldn't catch WebCrypto and
+// CryptoKit disagreeing on where the tag goes.
 const sealer = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
 const resealed = new Uint8Array(await crypto.subtle.encrypt(
   { name: "AES-GCM", iv: NONCE }, sealer, new TextEncoder().encode(PLAINTEXT)));

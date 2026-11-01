@@ -2,11 +2,10 @@
 //
 //   node worker-shared/setapp-test.mjs
 //
-// Pure functions and one `fetch` seam, so this needs no wrangler, no network and no secrets,
-// unlike the HTTP suites next door. It is the only check on two rules that are permanent if they
-// are wrong: the licence hash input (`setappUserID`), which cannot be changed once real users
-// have identities keyed on it, and the refusal map, where reading our own misconfiguration as
-// "your subscription lapsed" is the one answer §12 forbids handing a paying user.
+// Pure functions and one `fetch` seam, so no wrangler, network or secrets, unlike the HTTP suites
+// next door. It's the only check on two rules that are permanent if wrong: the licence hash input
+// (`setappUserID`), fixed once real identities are keyed on it, and the refusal map, where reading
+// our misconfiguration as "your subscription lapsed" is what §12 forbids telling a paying user.
 
 import {
   SETAPP_RECHECK_SECONDS, setappMisconfigured, setappUserID, verifySetappAccess,
@@ -24,8 +23,8 @@ const eq = (actual, expected, label) => {
   }
 };
 
-// A vendor API that answers from a table. Anything not in the table throws, which is how a test
-// asserts that a later call was never reached.
+// A vendor API answering from a table. Anything else throws, which is how a test asserts a later
+// call was never reached.
 const stub = (routes) => async (url) => {
   const path = url.replace("https://stub", "");
   const route = routes[path];
@@ -42,8 +41,8 @@ const token = { status: 200, body: { access_token: "at" } };
 const userinfo = { status: 200, body: { data: { id: 777 } } };
 
 console.log("setapp user id");
-// The hash is sha256("setapp:" + this), so the SPELLING is the contract, not the value. A number
-// today and a string tomorrow must not produce two identities for one person.
+// The hash is sha256("setapp:" + this), so the spelling is the contract, not the value. A number
+// today and a string tomorrow must not make two identities for one person.
 eq(setappUserID("12345"), "12345", "a string id passes through");
 eq(setappUserID(12345), "12345", "a JSON number becomes the same string");
 eq(setappUserID(" 12345 "), "12345", "whitespace is trimmed");
@@ -76,8 +75,7 @@ eq(await verifySetappAccess("CODE", env, stub({
   "/resource/v1/application/access": { status: 200, body: { data: { granted: false } } },
 })), { status: "refused", userID: null }, "granted false is a real refusal");
 
-// Anything other than an explicit `true` is a refusal: a body we cannot read must never be
-// optimistically treated as a yes.
+// Anything but an explicit `true` is a refusal: an unreadable body is never a yes.
 eq(await verifySetappAccess("CODE", env, stub({
   "/auth/v1/token": token,
   "/resource/v1/userinfo": userinfo,
@@ -85,8 +83,8 @@ eq(await verifySetappAccess("CODE", env, stub({
 })), { status: "refused", userID: null }, "a missing granted field is not a yes");
 
 console.log("failure map");
-// A spent or expired code. 4xx on the exchange is the CODE being bad, and no retry fixes it, so
-// the client is told `bad_license` and does not latch it (a fresh code is one launch away).
+// A spent or expired code. 4xx on the exchange means a bad code that no retry fixes, so the
+// client gets `bad_license` and doesn't latch it (a fresh code is one launch away).
 eq(await verifySetappAccess("CODE", env, stub({ "/auth/v1/token": { status: 400 } })),
    { status: "invalid", userID: null }, "a consumed code is invalid, not unreachable");
 
@@ -95,19 +93,17 @@ eq(await verifySetappAccess("CODE", env, stub({ "/auth/v1/token": { status: 503 
 eq(await verifySetappAccess("CODE", env, stub({ "/auth/v1/token": { status: 429 } })),
    { status: "unreachable", userID: null }, "vendor 429 is transient");
 
-// The whole reason `unreachable` and `refused` are different words. A scope mistake in OUR
-// deployment must never reach a paying subscriber as "your subscription lapsed", which both
-// clients latch and persist.
+// Why `unreachable` and `refused` are different words: a scope mistake in our deployment must
+// never reach a paying subscriber as "your subscription lapsed", which both clients latch.
 eq(await verifySetappAccess("CODE", env, stub({
   "/auth/v1/token": token,
   "/resource/v1/userinfo": userinfo,
   "/resource/v1/application/access": { status: 403 },
 })), { status: "unreachable", userID: null }, "our own scope bug never reads as a lapse");
 
-// The SAME rule one call earlier, which is where it was missing. `/userinfo` runs on the token we
-// just minted from our own client id and secret, so a 401 or 403 there is our scope or our deploy
-// too. It used to fall through to `invalid`, which both Workers answer as 403 `bad_license`: a
-// live subscriber told their licence was bad, by us, over our own misconfiguration.
+// The same rule one call earlier. `/userinfo` uses the token we just minted from our own client
+// id and secret, so a 401 or 403 there is our scope or deploy too. `invalid` would become 403
+// `bad_license`, telling a live subscriber their licence is bad over our misconfiguration.
 for (const status of [401, 403]) {
   eq(await verifySetappAccess("CODE", env, stub({
     "/auth/v1/token": token,

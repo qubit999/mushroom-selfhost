@@ -5,10 +5,9 @@
 #                npx wrangler dev --persist-to ../.wrangler-dev-state
 #   Terminal 2:  ./test.sh
 #
-# By default this seeds a licence and a device straight into the LOCAL D1, so the whole
-# matrix runs with no Gumroad key and nothing of the user's is touched. Set
-# MUSHROOM_TEST_LICENSE to a real key to exercise the live activation path too (it uses
-# increment_uses_count=false, so it costs no seat).
+# By default this seeds a licence and a device straight into the local D1, so it runs with no
+# Gumroad key and touches nothing of the user's. Set MUSHROOM_TEST_LICENSE to a real key to also
+# exercise live activation (increment_uses_count=false, so it costs no seat).
 set -uo pipefail
 
 BASE="${BASE:-http://localhost:8787}"
@@ -18,16 +17,15 @@ ADMIN_TOKEN="${ADMIN_TOKEN:-local-test-admin-token}"
 PASS=0
 FAIL=0
 
-# Database access, with two backends, because this suite is also the on-prem conformance suite.
+# Database access has two backends, because this is also the on-prem conformance suite.
 #
 #   ADMIN_SOCK unset -> `wrangler dev`, the hosted reference environment.
 #   ADMIN_SOCK set   -> a self-hosted workerd box (see selfhost/), which has no wrangler and no
 #                       account to reach. Same SQL, posted to the unix-socket admin route.
 #
-# The self-hosted branch reshapes its reply into `[{"results": [...]}]` printed the way
-# `wrangler d1 execute --json` prints it, indent and all, because callers below grep that text
-# directly for things like '"n": 5'. Matching the shape is what keeps every assertion in this
-# file identical between the two runs.
+# The self-hosted branch prints `[{"results": [...]}]` exactly as `wrangler d1 execute --json`
+# does, indent and all, because callers below grep it for things like '"n": 5'. That keeps every
+# assertion identical between the two runs.
 ADMIN_SOCK="${ADMIN_SOCK:-}"
 
 d1() {
@@ -53,9 +51,9 @@ status() { # status <curl args...>  -> prints http status
 
 echo "==> mushroom-files smoke matrix against $BASE"
 
-# Is there a schema? A database with no tables answers 500 to most of what follows and says
-# nothing about why, which is exactly what a deleted state directory looks like. `licenses`
-# comes from the first migration, so its absence means none of them have run.
+# Is there a schema? With no tables, most of what follows answers 500 with no hint why, which is
+# what a deleted state directory looks like. `licenses` comes from the first migration, so its
+# absence means none have run.
 if ! d1 "SELECT 1 FROM licenses LIMIT 1" >/dev/null 2>&1; then
   echo "The local database has no tables. Apply the migrations first:"
   if [ -n "$ADMIN_SOCK" ]; then
@@ -67,16 +65,17 @@ if ! d1 "SELECT 1 FROM licenses LIMIT 1" >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------- unauthenticated
-want "GET / redirects"                302 "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/")"
+# A self-hosted root redirects to BRAND_URL, or 404s when the box names nobody.
+ROOT=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/")
+if [ -n "$ADMIN_SOCK" ] && [ "$ROOT" = 404 ]; then want "GET / is 404 (no BRAND_URL)" 404 "$ROOT"
+else want "GET / redirects" 302 "$ROOT"; fi
 want "unknown path is 404"            404 "$(status "$BASE/nope")"
 want "unknown share token is 404"     404 "$(status "$BASE/f/doesnotexist")"
 want "list without a token is 401"    401 "$(status "$BASE/v1/files")"
 want "create without a token is 401"  401 "$(status -X POST "$BASE/v1/files")"
 want "activate with junk body is 400" 400 "$(status -X POST -H 'content-type: application/json' -d 'not json' "$BASE/v1/devices/activate")"
-# On a box with ENROLLMENT_HASHES set to "*" there is no such thing as a bad key, which is the
-# point of that setting: the Mac already verified the key with Gumroad before it reached the
-# Keychain, so the box takes whatever it is handed. Asserting a 403 there tests the opposite of
-# the configured behaviour, so say so and move on rather than reporting a failure.
+# With ENROLLMENT_HASHES="*" there's no such thing as a bad key: the box takes any string. A 403
+# there would test the opposite of the configuration, so say so and move on.
 if [ "${OPEN_ENROLLMENT:-0}" = "1" ]; then
   printf '  \033[33mskip\033[0m bad-key rejection: this box enrols any key (ENROLLMENT_HASHES=*)\n'
 else
@@ -123,8 +122,8 @@ done
 want "create with a malformed content_type is 400" 400 \
   "$(status -X POST "${AUTH[@]}" -H 'content-type: application/json' \
      -d '{"name":"x.bin","size":10,"content_type":"not a mime type"}' "$BASE/v1/files")"
-# An interior newline is what the type regex is really guarding: this value reaches the
-# plain-text abuse-report email, and .trim() only touches the ends.
+# An interior newline is what the type regex really guards: this value reaches the plain-text
+# abuse-report email, and .trim() only touches the ends.
 want "create with a newline in content_type is 400" 400 \
   "$(status -X POST "${AUTH[@]}" -H 'content-type: application/json' \
      -d '{"name":"x.bin","size":10,"content_type":"application/x\nType: forged"}' "$BASE/v1/files")"
@@ -146,9 +145,9 @@ STOKEN=$(printf '%s' "$CREATE" | python3 -c 'import json,sys; print(json.load(sy
 
 want "download before upload is 404" 404 "$(status "$BASE/f/$STOKEN")"
 
-# Send a body of a DIFFERENT length rather than forging the header: curl computes
-# content-length itself, and a hand-set one that disagrees with the body just stalls the
-# connection (it took the dev server down with it the first time).
+# Send a body of a different length rather than forging the header: curl computes
+# content-length itself, and a hand-set one that disagrees with the body stalls the connection
+# (and can take the dev server down).
 printf '%%PDF-1.4\n%s\n' "$(head -c 400 /dev/zero | tr '\0' 'y')" > /tmp/mf-wrong.pdf
 want "upload of the wrong length is 400" 400 \
   "$(status -X PUT "${AUTH[@]}" --data-binary @/tmp/mf-wrong.pdf "$BASE/v1/files/$ID/content")"
@@ -173,9 +172,9 @@ cmp -s /tmp/mf-body /tmp/mf-test.pdf && ok "bytes round-trip intact" || bad "byt
 want "range request is 206" 206 "$(status -H 'range: bytes=0-15' "$BASE/f/$STOKEN")"
 
 # ---------------------------------------------------------------- the receive page
-# One URL, two answers. A browser navigating gets the page that can decrypt; the page's own
-# fetch, curl and everything else send */* and get the bytes. Getting this backwards means
-# either recipients download ciphertext they cannot open, or the page fetches itself.
+# One URL, two answers. A navigating browser gets the page that can decrypt; the page's own
+# fetch, curl and everything else send */* and get the bytes. Backwards, recipients download
+# ciphertext they can't open, or the page fetches itself.
 PAGE=$(curl -s -H 'accept: text/html,application/xhtml+xml' "$BASE/f/$STOKEN")
 grep -q 'crypto.subtle.decrypt' <<<"$PAGE" \
   && ok "a browser gets the receive page" || bad "a browser gets the receive page" "no decrypt in body"
@@ -204,8 +203,8 @@ head -c 20 /dev/zero | tr '\0' 'M' > /tmp/mf-fake.png
 want "a non-PNG claiming image/png is 415" 415 \
   "$(status -X PUT "${AUTH[@]}" --data-binary @/tmp/mf-fake.png "$BASE/v1/files/$ID2/content")"
 
-# Sealed bytes match no signature by construction, so the sniff has to stand down for them
-# or every upload from 1.38.0 onwards is refused. Same body, same declared type, one header.
+# Sealed bytes match no signature, so the sniff must stand down for them or every sealed upload
+# is refused. Same body, same declared type, one header.
 CREATE2B=$(curl -s -X POST "${AUTH[@]}" -H 'content-type: application/json' \
   -d '{"name":"sealed.png","size":20,"content_type":"image/png"}' "$BASE/v1/files")
 ID2B=$(printf '%s' "$CREATE2B" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
@@ -229,19 +228,18 @@ CREATE3=$(curl -s -X POST "${AUTH[@]}" -H 'content-type: application/json' \
 ID3=$(printf '%s' "$CREATE3" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
 STOKEN3=$(printf '%s' "$CREATE3" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))')
 curl -s -o /dev/null -X PUT "${AUTH[@]}" --data-binary @/tmp/mf-test.pdf "$BASE/v1/files/$ID3/content"
-# Backdating the row is the only practical way to test a 24 hour rule. Backdate by a
-# MINUTE, not to the epoch: an epoch timestamp is also past the 7 day tombstone cutoff,
-# so the same sweep would mark the row expired and then delete it, and the check below
-# would read a correct sweep as a broken one.
+# Backdating the row is the only practical way to test a 24-hour rule. Backdate by a minute,
+# not to the epoch: that's also past the 7-day tombstone cutoff, so the sweep would expire and
+# then delete the row, and the check below would read a correct sweep as broken.
 d1 "UPDATE files SET expires_at = $(( $(date +%s) - 60 )) WHERE id = '$ID3'" >/dev/null 2>&1
 want "an expired link is 410" 410 "$(status "$BASE/f/$STOKEN3")"
 
-# The handler does its work in ctx.waitUntil, so the response comes back before the D1
-# writes land. Reading straight away raced it and reported a working sweep as broken.
+# The handler works in ctx.waitUntil, so the response returns before the D1 writes land;
+# reading at once would race them and report a working sweep as broken.
 #
-# workerd has no cron at all, so on a self-hosted box a systemd timer calls the admin route
-# instead. That route awaits the waitUntil promises before answering, so it does not need the
-# sleep, but the sleep is harmless and keeping one code path here is worth more.
+# workerd has no cron, so on a self-hosted box a systemd timer calls the admin route, which
+# awaits the waitUntil promises before answering. The sleep is harmless there, and one code path
+# is worth more.
 if [ -n "$ADMIN_SOCK" ]; then
   curl -s -o /dev/null --unix-socket "$ADMIN_SOCK" -X POST http://local/_selfhost/cron
 else
@@ -254,28 +252,25 @@ LEFT=$(d1 "SELECT state FROM files WHERE id = '$ID3'" --json 2>/dev/null | grep 
 # ---------------------------------------------------------------- abuse reports
 #
 # Needs TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA (Cloudflare's documented
-# always-passes test secret) in .dev.vars, and any token shaped like a dummy one. The
-# always-FAILS secret is 2x00...AA if you want to check the rejection path by hand.
+# always-passes test secret) in .dev.vars, and any dummy-shaped token. The always-fails secret
+# is 2x00...AA, for checking the rejection path by hand.
 #
-# Skipped entirely on a self-hosted box, and this is a real absence rather than a convenience.
-# Abuse reporting needs Turnstile and an email binding, and a box with no outbound network has
-# neither: every report answers 403 bot_check because `turnstileOK` cannot reach Cloudflare.
-# deploy/README.md already tells self-hosting customers that abuse reporting will not work.
+# Skipped on a self-hosted box, a real absence: abuse reporting needs Turnstile and an email
+# binding, and a box with no outbound network has neither (every report answers 403 bot_check,
+# as `turnstileOK` can't reach Cloudflare). deploy/README.md tells self-hosters it won't work.
 #
-# Reported as skipped rather than left to fail, for the reason APPSTORE_APP_APPLE_ID is set in
-# the on-prem config: thirteen permanently red assertions is a differential people stop reading,
-# and then it stops catching the drift it exists to catch.
+# Reported as skipped rather than failing, for the same reason APPSTORE_APP_APPLE_ID is set in
+# the on-prem config: thirteen permanently red assertions is a differential people stop reading.
 #
-# The body below is deliberately not re-indented, so this stays a two-line diff.
+# The body below isn't re-indented, to keep the skip a two-line diff.
 ORIGIN='origin: https://www.getmushroom.app'
 REPORT=$BASE/v1/abuse-reports
 DUMMY=XXXX.DUMMY.TOKEN.XXXX
 
-# A file to report. Uploaded so it is 'ready' and therefore findable by token.
+# A file to report, uploaded so it's 'ready' and findable by token.
 #
-# Created OUTSIDE the skip below, because the owner-actions section further down deletes this
-# same file and asserts its link then 410s. Skipping its creation quietly broke two assertions
-# that have nothing to do with abuse reporting.
+# Created outside the skip below: the owner-actions section deletes this same file and asserts
+# its link then 410s, so skipping it would break two unrelated assertions.
 CREATE4=$(curl -s -X POST "${AUTH[@]}" -H 'content-type: application/json' \
   -d "{\"name\":\"reported.pdf\",\"size\":$SIZE,\"content_type\":\"application/pdf\"}" "$BASE/v1/files")
 ID4=$(printf '%s' "$CREATE4" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
@@ -287,12 +282,11 @@ if [ -n "$ADMIN_SOCK" ]; then
   printf '  \033[33mskip\033[0m abuse reporting: needs Turnstile and email, which a self-hosted box has neither of\n'
 else
 
-# Every field is passed explicitly. Appending a second -F for the same name does NOT
-# override the first: multipart keeps both and form.get() returns the earlier one, which
-# quietly made three "invalid input" cases send perfectly valid input.
-# --form-string, not -F: curl's -F reads a value starting with "<" from a FILE and one
-# starting with "@" as an upload, so -F 'name=<script>...' silently sent nothing and the
-# XSS case tested nothing at all. --form-string never interprets the value.
+# Every field is passed explicitly. A second -F for the same name doesn't override the first:
+# multipart keeps both and form.get() returns the earlier, so "invalid input" cases would send
+# valid input.
+# --form-string, not -F: -F reads a value starting with "<" from a file and "@" as an upload,
+# so -F 'name=<script>...' sends nothing and the XSS case tests nothing.
 report() { # report <share_url> [reason] [name] [email] [details]
   curl -s -o /tmp/mf-body -w '%{http_code}' -X POST -H "$ORIGIN" \
     --form-string "share_url=$1" --form-string "reason=${2-malware}" \
@@ -317,15 +311,12 @@ want "a valid report is accepted" 200 "$(report "$SHARE")"
 grep -q 'reviewed' /tmp/mf-body && ok "report reply is the generic one" || bad "report reply" "$(cat /tmp/mf-body)"
 REAL_BODY=$(cat /tmp/mf-body)
 
-# The whole point: a link that does not exist must be indistinguishable from one that does.
+# The point: a link that doesn't exist must be indistinguishable from one that does.
 FAKE="https://files.getmushroom.app/f/AAAAAAAAAAAAAAAAAAAAAA"
 
-# A DELTA across the report, not an absolute row count.
-#
-# This used to assert the whole table held exactly one row, which is only true against a
-# freshly migrated database. `--persist-to` keeps state between runs, so a second run of this
-# suite failed here with rows=4 and looked like a real regression in a security assertion. The
-# two checks below it were never fragile, because they scope to a file id created this run.
+# A delta across the report, not an absolute row count: `--persist-to` keeps state between
+# runs, so an absolute count fails on a second run and looks like a security regression. The
+# two checks below scope to a file id created this run.
 reports_now() {
   d1 "SELECT COUNT(*) AS n FROM abuse_reports" --json 2>/dev/null | grep -o '"n": [0-9]*' | grep -o '[0-9]*'
 }
@@ -347,24 +338,33 @@ want "a different reason on the same file is accepted" 200 "$(report "$SHARE" ph
 TWO=$(d1 "SELECT COUNT(*) AS n FROM abuse_reports WHERE file_id = '$ID4'" --json 2>/dev/null | grep -o '"n": [0-9]*' | grep -o '[0-9]*')
 [ "$TWO" = "2" ] && ok "a new reason does store" || bad "new reason not stored" "rows=$TWO"
 
-# Reporter text is stored raw and escaped at render time; assert it is not executable
-# anywhere it is echoed.
+# Reporter text is stored raw and escaped at render time; assert it isn't executable anywhere
+# it's echoed.
 report "$SHARE" copyright '<script>alert(1)</script>' x@y.z >/dev/null
 grep -q "script" <<<"$(d1 "SELECT reporter_name FROM abuse_reports WHERE reason='copyright'" --json 2>/dev/null)" \
   && ok "reporter text stored verbatim (escaped on render)" || bad "reporter text" "not stored"
 fi
 
 # ---------------------------------------------------------------- owner actions
-want "admin without a token is 401"   401 "$(status -X POST -H 'content-type: application/json' -d '{}' "$BASE/admin/files/delete")"
-want "admin with a wrong token is 401" 401 "$(status -X POST -H 'authorization: Bearer wrong' -d '{}' "$BASE/admin/files/delete")"
-want "GET on an admin path never acts" 405 "$(status "$BASE/admin/files/delete")"
-want "unknown admin path is 404"       404 "$(status -X POST -H "authorization: Bearer $ADMIN_TOKEN" -d '{}' "$BASE/admin/nope")"
+# A self-hosted box answers admin only on its socket, so the same requests go there.
+# `${AS[@]+...}` because bash 3.2 calls an empty array unbound under `set -u`.
+if [ -n "$ADMIN_SOCK" ]; then
+  ABASE=http://local; AS=(--unix-socket "$ADMIN_SOCK")
+  want "admin over http is 404 on a self-hosted box, even with the token" 404 \
+    "$(status -X POST -H "authorization: Bearer $ADMIN_TOKEN" -d '{}' "$BASE/admin/files/delete")"
+else
+  ABASE=$BASE; AS=()
+fi
+want "admin without a token is 401"   401 "$(status ${AS[@]+"${AS[@]}"} -X POST -H 'content-type: application/json' -d '{}' "$ABASE/admin/files/delete")"
+want "admin with a wrong token is 401" 401 "$(status ${AS[@]+"${AS[@]}"} -X POST -H 'authorization: Bearer wrong' -d '{}' "$ABASE/admin/files/delete")"
+want "GET on an admin path never acts" 405 "$(status ${AS[@]+"${AS[@]}"} "$ABASE/admin/files/delete")"
+want "unknown admin path is 404"       404 "$(status ${AS[@]+"${AS[@]}"} -X POST -H "authorization: Bearer $ADMIN_TOKEN" -d '{}' "$ABASE/admin/nope")"
 
 ADMIN=(-H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json')
 want "admin delete of an unknown file is 404" 404 \
-  "$(status -X POST "${ADMIN[@]}" -d '{"file_id":"00000000-0000-0000-0000-000000000000"}' "$BASE/admin/files/delete")"
+  "$(status ${AS[@]+"${AS[@]}"} -X POST "${ADMIN[@]}" -d '{"file_id":"00000000-0000-0000-0000-000000000000"}' "$ABASE/admin/files/delete")"
 want "admin deletes the reported file" 200 \
-  "$(status -X POST "${ADMIN[@]}" -d "{\"file_id\":\"$ID4\"}" "$BASE/admin/files/delete")"
+  "$(status ${AS[@]+"${AS[@]}"} -X POST "${ADMIN[@]}" -d "{\"file_id\":\"$ID4\"}" "$ABASE/admin/files/delete")"
 want "the reported link is now 410" 410 "$(status "$BASE/f/$STOKEN4")"
 
 # Block: one more live file, then block the licence and confirm it is gone and uploads stop.
@@ -375,7 +375,7 @@ curl -s -o /dev/null -X PUT "${AUTH[@]}" --data-binary @/tmp/mf-test.pdf "$BASE/
 LICHASH=$(d1 "SELECT license_hash FROM files WHERE id = '$ID5'" --json 2>/dev/null | grep -o '"license_hash": "[^"]*"' | cut -d'"' -f4)
 
 want "admin blocks the licence" 200 \
-  "$(status -X POST "${ADMIN[@]}" -d "{\"license_hash\":\"$LICHASH\"}" "$BASE/admin/licenses/block")"
+  "$(status ${AS[@]+"${AS[@]}"} -X POST "${ADMIN[@]}" -d "{\"license_hash\":\"$LICHASH\"}" "$ABASE/admin/licenses/block")"
 GONE=$(d1 "SELECT state FROM files WHERE id = '$ID5'" --json 2>/dev/null | grep -c '"deleted"')
 [ "$GONE" -ge 1 ] && ok "block deleted the licence's live files" || bad "block left files live" "state not deleted"
 # The device token was revoked with the licence, so the app is locked out at the door.

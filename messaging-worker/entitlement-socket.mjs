@@ -1,34 +1,32 @@
-// The one assertion curl cannot make: a LIVE WebSocket has to stop working when the licence's
+// The one assertion curl can't make: a live WebSocket must stop working when the licence's
 // entitlement horizon passes underneath it.
 //
-// Driven by test-entitlement.sh, which seeds the licence and the device and passes the token in.
-// Node's global WebSocket (v22+) is enough; there is no dependency to install.
+// Driven by test-entitlement.sh, which seeds the licence and device and passes the token in.
+// Node's global WebSocket (v22+) is enough; nothing to install.
 //
-// Two modes, and the pair is the point. "alive" is the control: with no horizon the very same
-// ping must come back as a pong, so a "lapses" run that closes for some unrelated reason (a dead
-// server, a bad token, a renamed frame) cannot be mistaken for the clause doing its job.
+// Two modes, and the pair is the point. "alive" is the control: with no horizon the same ping
+// must pong, so a "lapses" run that closes for an unrelated reason (dead server, bad token,
+// renamed frame) can't pass for the clause doing its job.
 //
 //   alive   NULL entitled_until  -> ping answers pong
-//   lapses  a horizon seconds away -> the first frame AFTER it passes closes the socket
+//   lapses  a horizon seconds away -> the first frame after it passes closes the socket
 //
-// The lapse probe takes the FRAME TYPE as a third argument, and that is the whole reason this
-// file is worth more than a curl. `stillAuthorized` guards send, ack, typing and ping, and it
-// used to guard ping ALONE: a lapsed subscriber whose client simply stopped pinging kept sending
-// and acking indefinitely. A probe that only ever pings reproduces exactly that blind spot, so
-// deleting the guard from `send` would leave this suite green. Drive every guarded frame.
+// The lapse probe takes the frame type as a third argument, which is what makes this worth more
+// than a curl. `stillAuthorized` guards send, ack, typing and ping. A ping-only probe can't see a
+// lapsed client that stops pinging but keeps sending and acking, so removing the guard from
+// `send` would leave this green. Drive every guarded frame.
 //
-// A frame that is not `ping` produces no reply of its own, so "still open" cannot be read off a
-// silence. When the probe frame does not close the socket, the script sends a ping afterwards: a
-// pong then proves the socket was alive and only THAT frame's guard was missing, which is a far
-// more precise failure than "nothing happened".
+// Non-ping frames get no reply, so silence doesn't prove "still open". If the probe frame doesn't
+// close the socket, the script pings: a pong proves the socket was alive and only that frame's
+// guard is missing, a far more precise failure than "nothing happened".
 //
 // Same rule as the rest of the repo: never print a token.
 
 const BASE = process.env.BASE ?? "http://localhost:8788";
 const [token, mode, frameType = "ping"] = process.argv.slice(2);
 
-// Enough shape for the handler behind each guard; the guard runs first, so these never need to
-// be deliverable. `peer` is 64 hex chars because `friendAction` and the typing relay validate it.
+// Enough shape for each guarded handler; the guard runs first, so these needn't be deliverable.
+// `peer` is 64 hex chars because `friendAction` and the typing relay validate it.
 const PROBE = {
   ping: { t: "ping" },
   typing: { t: "typing", peer: "0".repeat(64), on: true },
@@ -49,11 +47,9 @@ const settled = (ms) => new Promise((resolve) => {
   let done = false;
   const finish = (value) => { if (!done) { done = true; resolve(value); } };
   socket.addEventListener("message", (event) => {
-    // Guarded, and not belt-and-braces: this socket also carries hello, message, ack, typing and
-    // presence frames, and a binary one arrives as a Blob rather than a string. An uncaught throw
-    // in an EventTarget listener leaves this promise unresolved, so it falls through to the
-    // timeout and reports "nothing" - a FAIL on the single assertion this whole file exists for,
-    // for a reason that has nothing to do with the entitlement clause.
+    // Guarded for real: this socket also carries other frames, and a binary one arrives as a
+    // Blob. A throw in an EventTarget listener leaves the promise unresolved, so it times out and
+    // reports "nothing", failing this file's one assertion for an unrelated reason.
     let frame;
     try { frame = JSON.parse(event.data); } catch { return; }
     if (frame?.t === "pong") finish("pong");
@@ -71,16 +67,14 @@ try {
   });
 
   if (mode === "lapses") {
-    // The horizon was seeded a few seconds out, so it passes while this socket sits there
-    // authenticated. Nothing pushes that fact at the connection: `stillAuthorized` is the only
-    // thing that can notice, and it only runs when a frame arrives.
+    // The horizon was seeded seconds out, so it passes while this socket sits authenticated.
+    // Only `stillAuthorized` can notice, and only when a frame arrives.
     await new Promise((resolve) => setTimeout(resolve, LAPSE_WAIT_MS));
     socket.send(JSON.stringify(PROBE));
     const label = `a live socket is dropped once the horizon passes (${frameType})`;
     let what = await settled(4000);
-    // Silence from a non-ping probe is ambiguous on its own: the guard may have been skipped, or
-    // the server may simply be gone. A ping disambiguates, because ping is guarded too, so on a
-    // lapsed licence it must ALSO close rather than pong.
+    // Silence from a non-ping probe is ambiguous: a skipped guard, or a dead server. A ping
+    // settles it, because ping is guarded too, so on a lapsed licence it must also close.
     if (what === "nothing" && frameType !== "ping" && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ t: "ping" }));
       const after = await settled(4000);

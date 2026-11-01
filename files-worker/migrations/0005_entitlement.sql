@@ -1,24 +1,21 @@
 -- When a licence's access to Spore Storage runs out. NULL means never.
 --
--- The whole grandfathering story is the absence of a DEFAULT here. Every row that exists when
--- this runs gets NULL, so every user who has ever activated keeps file sharing permanently, with
--- no backfill script, no purchase dates and no date arithmetic that could be wrong. That is App
--- Store Review Guideline 3.1.2(a) ("you should not take away the primary functionality existing
--- users have already paid for") satisfied by a schema default rather than by code.
+-- Grandfathering is the absence of a DEFAULT: every existing row gets NULL, so everyone who ever
+-- activated keeps file sharing permanently, with no backfill, purchase dates or date math to get
+-- wrong. App Store Review Guideline 3.1.2(a) ("you should not take away the primary functionality
+-- existing users have already paid for"), satisfied by the schema rather than by code.
 --
--- Unix seconds, matching every other timestamp in this database. Read by the auth JOIN in
--- `authenticate` (which drops an expired row and therefore 401s, except on the release route,
--- where cleanup has to keep working) and written by the upsert in `activateDevice`, whose CASE
--- is monotonic in BOTH directions: a NULL can never become a horizon and a horizon can never
--- become NULL. Only horizon -> horizon moves, which is what a renewal is.
+-- Unix seconds, like every timestamp here. Read by the auth JOIN in `authenticate` (an expired
+-- row 401s, except on the release route, where cleanup must keep working); written by the upsert
+-- in `activateDevice`, whose CASE is monotonic both ways: NULL never becomes a horizon, a horizon
+-- never becomes NULL. Only horizon -> horizon moves, which is a renewal.
 --
--- Same column, same reasoning, as messaging-worker/migrations/0006_entitlement.sql. Both workers
--- have to agree or a subscriber would keep one feature and lose the other.
+-- Same column as messaging-worker/migrations/0006_entitlement.sql. Both workers must agree or a
+-- subscriber would keep one feature and lose the other.
 ALTER TABLE licenses ADD COLUMN entitled_until INTEGER;
 
--- The seat cap on the App Store redeem path counts rows by sale (`SELECT COUNT(*) FROM licenses
--- WHERE gumroad_sale_id = ?`), and until it existed this column was only ever read back by
--- primary key, so nothing indexed it. Without this every redeem activation full-scans the table,
--- on the unauthenticated /v1/devices/activate path the rate limiter is already sized around.
--- Partial, because an App Store row that never redeemed has no sale id and is not worth a slot.
+-- The seat cap counts rows by sale (`SELECT COUNT(*) FROM licenses WHERE gumroad_sale_id = ?`).
+-- Without an index every such activation full-scans the table, on the unauthenticated
+-- /v1/devices/activate path the rate limiter is sized around. Partial, because a row with no
+-- sale id isn't worth a slot.
 CREATE INDEX idx_licenses_sale ON licenses(gumroad_sale_id) WHERE gumroad_sale_id IS NOT NULL;

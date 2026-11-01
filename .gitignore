@@ -1,13 +1,13 @@
-# This tree is published. Everything below either holds a secret, points at OUR deployment, or
-# is build output, and none of it belongs in a public repo.
+# This tree is published. Everything below holds a secret, points at our deployment, or is build
+# output, and none of it belongs in a public repo.
 #
-# The publish script (publish-selfhost.sh) works from an allowlist and does not rely on this
-# file, deliberately: two independent mechanisms, because the cost of one of them being wrong
-# once is a live database id on the internet.
+# The publish script (publish-selfhost.sh) works from an allowlist and doesn't rely on this file:
+# two independent mechanisms, because one being wrong once puts a live database id on the
+# internet.
 
-# The REAL deployment configs. These carry the live D1 database ids of our hosted deployment.
-# Untracked on purpose, and kept on disk so `wrangler deploy` still works from a dev machine.
-# A fresh clone has to recreate them from wrangler.example.jsonc, which is tracked.
+# The real deployment configs, carrying our hosted deployment's live D1 database ids. Untracked
+# on purpose and kept on disk so `wrangler deploy` works from a dev machine. A fresh clone
+# recreates them from the tracked wrangler.example.jsonc.
 messaging-worker/wrangler.jsonc
 files-worker/wrangler.jsonc
 
@@ -20,11 +20,11 @@ files-worker/wrangler.test.jsonc
 **/.dev.vars
 
 # A filled-in on-prem config holds ADMIN_TOKEN and the enrollment hashes.
-# config.capnp.example IS tracked; this is the copy an operator edits.
-# Under Docker it is derived at container start and never written to the host at all.
+# config.capnp.example is tracked; this is the copy an operator edits.
+# Under Docker it's derived at container start and never written to the host.
 config.capnp
 
-# The Docker deployment's two. .env.example IS tracked; .env is the copy an operator edits, and
+# The Docker deployment's two. .env.example is tracked; .env is the operator's copy, and
 # secrets.env holds the generated admin token and durable-object keys.
 .env
 secrets.env
@@ -39,11 +39,11 @@ dist/
 node_modules/
 .wrangler/
 .wrangler-dev-state/
-# Second local state dir, for running the two Workers side by side (files on 8787,
-# messaging on 8788). One state dir cannot serve both: the D1 binding name is the same.
+# Second local state dir, for running both Workers side by side (files on 8787, messaging on
+# 8788). One can't serve both: the D1 binding name is the same.
 .wrangler-dev-state-msg/
 
-# Durable-object state and blobs, if anyone runs a box from inside the checkout.
+# Durable-object state and blobs, if someone runs a box inside the checkout.
 do-messaging/
 do-files/
 blobs/

@@ -1,15 +1,19 @@
-# Build output and local state. dist/ in particular MUST be excluded: a stale one copied in
-# would be silently served instead of the one build.sh produces during the image build.
-dist/
-node_modules/
-.wrangler/
-.wrangler-dev-state/
-do-messaging/
-do-files/
-blobs/
+# Build output and local state. dist/ especially: a stale copy would be served instead of the
+# one build.sh produces during the image build.
+#
+# `**/` throughout: unlike .gitignore, a bare pattern here matches only at the context root, and
+# the workers keep their own node_modules, .wrangler and logs a level down.
+**/dist/
+**/node_modules/
+**/.wrangler/
+**/.wrangler-dev-state/
+**/.wrangler-dev-state-msg/
+**/do-messaging/
+**/do-files/
+**/blobs/
 
-# Secrets and anything pointing at OUR deployment. Same list as .gitignore, for the same reason:
-# an image is as publishable as a repo, and these are the files that must never travel.
+# Secrets and anything pointing at our deployment. Same list as .gitignore: an image is as
+# publishable as a repo, and these must never travel.
 config.capnp
 .env
 secrets.env
@@ -21,6 +25,6 @@ messaging-worker/wrangler.test.jsonc
 files-worker/wrangler.test.jsonc
 .test-*.capnp
 
-.git/
-.DS_Store
-*.log
+**/.git/
+**/.DS_Store
+**/*.log

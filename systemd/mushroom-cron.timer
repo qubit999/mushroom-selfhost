@@ -3,12 +3,12 @@ Description=Mushroom expiry sweeps, hourly
 Documentation=file:/opt/mushroom/README.md
 
 [Timer]
-# Hourly, matching the files worker's own cron schedule when we host it.
+# Hourly, like the files worker's cron when we host it.
 OnCalendar=hourly
-# Run a missed sweep after a reboot or a period with the box switched off, rather than waiting
-# for the next hour. Expired files sitting on disk are the thing this exists to prevent.
+# Run a missed sweep after a reboot or downtime rather than waiting an hour: expired files left
+# on disk are what this prevents.
 Persistent=true
-# Spread the start so a fleet of boxes does not all sweep on the same second.
+# Spread the start so a fleet of boxes doesn't sweep on the same second.
 RandomizedDelaySec=5m
 
 [Install]

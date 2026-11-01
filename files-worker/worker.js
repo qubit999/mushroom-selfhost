@@ -1,18 +1,16 @@
 // mushroom-files: temporary file sharing for Mushroom.
 //
-// A licensed Mac exchanges its Gumroad key for a device token once, then uploads files
-// that live for 24 hours behind an unguessable link. Storage is a PRIVATE R2 bucket;
-// nothing is ever publicly listable and the bucket has no r2.dev domain.
+// A licensed Mac trades its Gumroad key for a device token once, then uploads files that live
+// 24 hours behind an unguessable link. Storage is a private R2 bucket: nothing is publicly
+// listable and there's no r2.dev domain.
 //
-// LOGGING RULE, and it is not negotiable: observability is on and logs are retained, so
-// this file must never log a filename, a share token, a license key or a bearer token.
-// Ids and status codes only. (The app takes the same line: PluginToolbox wraps its
-// argument logging in #if DEBUG for exactly this reason.)
+// Logging rule, not negotiable: logs are retained, so never log a filename, share token,
+// license key or bearer token. Ids and status codes only. (The app agrees: PluginToolbox
+// wraps its argument logging in #if DEBUG for this reason.)
 
-// Neither is a secret; both match LicenseManager.productIDs and mushroom-messaging's copy of
-// this list. Membership first because new keys are the common case; a one-time key costs one
-// extra round trip. Old one-time keys must verify FOREVER, which is what the second entry is
-// for and why it can never be removed.
+// Not secrets; both match LicenseManager.productIDs and mushroom-messaging's list. Membership
+// first because new keys are the common case. Old one-time keys must verify forever, so the
+// second entry can never go.
 const GUMROAD_PRODUCT_IDS = [
   "O8DPu_83HyipF99edOojUQ==",  // Mushroom Membership (subscription)
   "59Bhmk7nBsjAqKhst9Bf9g==",  // Mushroom macOS app (one-time, pre-subscription)
@@ -21,13 +19,11 @@ const GUMROAD_PRODUCT_IDS = [
 const MAX_FILE_BYTES = 95 * 1024 * 1024;        // 95 MiB, under Cloudflare's 100 MB body cap
 const TTL_SECONDS = 24 * 60 * 60;
 const MAX_ACTIVE_FILES_PER_LICENSE = 50;
-// 50 files at MAX_FILE_BYTES would be 4.6 GiB, so this binds first at ~32 max-size files.
-// Deliberate: the file count is the cap for ordinary drops, this is the cap on the bill.
+// 50 max-size files would be 4.6 GiB, so this binds first at ~32. On purpose: the file count
+// caps ordinary drops, this caps the bill.
 const MAX_ACTIVE_BYTES_PER_LICENSE = 3 * 1024 * 1024 * 1024;
-// MUST stay equal to mushroom-messaging's copy AND to `LicenseVerifier.seatCap`. See the long
-// note there. All three were 3 and all three are 5 as of the iPhone companion: the app spends
-// five activations on Gumroad, both Workers keep five device rows, and that is one allowance
-// rather than two numbers that happen to be near each other.
+// Must equal mushroom-messaging's copy and `LicenseVerifier.seatCap` (see the note there): the
+// app spends five activations on Gumroad and both Workers keep five device rows, one allowance.
 const MAX_DEVICES_PER_LICENSE = 5;
 const MAX_NAME_CHARS = 120;
 const MAX_DEVICE_NAME_CHARS = 60;
@@ -46,13 +42,12 @@ const REPORT_CONTACT_SECONDS = 30 * 24 * 60 * 60;    // then name/email are clea
 const REPORT_RETENTION_SECONDS = 180 * 24 * 60 * 60; // then the row goes
 const REPORT_RETRY_BATCH = 10;
 
-/// The only origins the report form may be served from. The form is one of two browser
-/// callers of this Worker (the other is the receive page, which is served from here and so
-/// needs no CORS at all); everything else is the Mac app, which sends no Origin.
+/// The only origins the report form may be served from. It's one of two browser callers (the
+/// receive page is served from here, so needs no CORS); everything else is the Mac app, which
+/// sends no Origin.
 ///
-/// Overridable with the `REPORT_ORIGINS` var, comma separated, so a self-hosted deployment
-/// serving its own copy of the form is not rejected by our hostnames. Defaulted rather than
-/// required, so our own deploy cannot regress by forgetting to set it.
+/// `REPORT_ORIGINS` (comma separated) lets a self-hosted deployment serve its own form.
+/// Defaulted, so our own deploy can't regress by forgetting it.
 const DEFAULT_REPORT_ORIGINS = ["https://getmushroom.app", "https://www.getmushroom.app"];
 
 function reportOrigins(env) {
@@ -64,38 +59,32 @@ const REPORT_ACTION = "report";
 const ABUSE_FROM = "abuse@getmushroom.app";   // send only, there is no such mailbox
 const ABUSE_TO = "hello@getmushroom.app";
 
-/// Where a stranger is sent when they land on this Worker with no link: the root, and the
-/// footer of the expired and removed pages.
+/// Where a stranger lands with no link: the root, and the footer of the expired and removed
+/// pages.
 ///
-/// `BRAND_URL` exists because those two pages are the only thing a self-hoster's recipients
-/// ever see, and they used to advertise getmushroom.app from a box we have nothing to do
-/// with. Set it to empty and this deployment names nobody: the root answers 404 and the
-/// pages carry no link. Defaulted to ours so our own deploy cannot regress.
+/// Those pages are all a self-hoster's recipients ever see, and shouldn't advertise
+/// getmushroom.app from a box we have nothing to do with. Empty `BRAND_URL` names nobody: the
+/// root 404s and the pages carry no link. Defaulted to ours so our deploy can't regress.
 function brandURL(env) {
   return env.BRAND_URL === undefined ? "https://www.getmushroom.app" : String(env.BRAND_URL).trim();
 }
 
-/// Same reply every well-formed submission gets, whether the link was real, already
-/// expired, a duplicate, or never existed. Confirming that a token resolves would turn
-/// this endpoint into an oracle for guessing share links.
+/// The reply to every well-formed submission, real link or not. Confirming that a token
+/// resolves would make this an oracle for guessing share links.
 const REPORT_ACCEPTED = "Thank you. If this is an active Mushroom link, it will be reviewed.";
 
-// Known file signatures. This USED to be an allowlist as well; it is not any more, and
-// any type may be shared. What made that safe was never this list: the download path
-// serves every file as octet-stream + attachment + nosniff + `default-src 'none'; sandbox`
-// unconditionally, so attacker-chosen HTML or SVG cannot execute on the domain either way.
-// What the allowlist really bought was bounded malware-hosting exposure, and the takedown
-// flow it was waiting on (abuse reports, admin delete, license block) now exists.
+// Known file signatures. Not an allowlist: any type may be shared. Safety comes from the
+// download path, which always serves octet-stream + attachment + nosniff +
+// `default-src 'none'; sandbox`, so attacker-chosen HTML or SVG can't execute on the domain.
+// Malware hosting is handled by the takedown flow (abuse reports, admin delete, license block).
 //
-// The signatures stay because they are free and still true: checked against the real first
-// bytes during upload, so a renamed .exe DECLARING image/png is still refused. A type with
-// no entry here is simply not checked. Every entry is a list of {at, bytes} clauses that
-// must ALL match. `null` means the format has no signature worth checking.
+// The signatures are free and still useful: checked against the real first bytes, so a
+// renamed .exe declaring image/png is refused. Unlisted types aren't checked. Each entry is
+// {at, bytes} clauses that must all match; `null` means no signature worth checking.
 const TYPE_SIGNATURES = {
   "image/jpeg": [{ at: 0, bytes: [0xff, 0xd8, 0xff] }],
   "image/png": [{ at: 0, bytes: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] }],
-  // "RIFF" alone also matches .wav and .avi, so the "WEBP" tag at byte 8 is what
-  // actually decides it.
+  // "RIFF" also matches .wav and .avi; the "WEBP" tag at byte 8 decides it.
   "image/webp": [{ at: 0, bytes: [0x52, 0x49, 0x46, 0x46] },
                  { at: 8, bytes: [0x57, 0x45, 0x42, 0x50] }],
   "image/heic": [{ at: 4, bytes: [0x66, 0x74, 0x79, 0x70] }],   // "ftyp" box
@@ -107,9 +96,8 @@ const TYPE_SIGNATURES = {
 
 const SNIFF_BYTES = 16;
 
-/// A well-formed `type/subtype`, RFC 6838 restricted-name characters, each half capped so
-/// the whole string cannot exceed 127. Replaces the allowlist as the validator of this
-/// field: see the call site in createFile.
+/// A well-formed `type/subtype` in RFC 6838 restricted-name characters, each half capped so
+/// the whole stays under 127. The validator for this field; see createFile.
 const TYPE_RE = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,62}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,62}$/;
 
 // ---------------------------------------------------------------- helpers
@@ -130,8 +118,8 @@ async function sha256Hex(text) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// The app trims and uppercases before hashing too (Kit: FileShare). Keep them in step or
-// the same key produces two different identities.
+// The app trims and uppercases too (Kit: FileShare). Keep them in step or one key becomes two
+// identities.
 const licenseHash = (key) => sha256Hex(key.trim().toUpperCase());
 
 function shareToken() {
@@ -141,8 +129,8 @@ function shareToken() {
 
 const now = () => Math.floor(Date.now() / 1000);
 
-/// Mirror of FileShare.sanitize in the Kit. The client sanitizes so the user sees the
-/// name it will really have; this exists because the client is not to be trusted.
+/// Mirrors FileShare.sanitize in the Kit. The client sanitizes so the user sees the real name;
+/// this is here because the client isn't trusted.
 function sanitizeName(raw) {
   let name = String(raw ?? "")
     .replace(/[\u0000-\u001f\u007f]/g, "")
@@ -153,7 +141,7 @@ function sanitizeName(raw) {
     .trim();
   if (name.length > MAX_NAME_CHARS) {
     const dot = name.lastIndexOf(".");
-    // Keep the extension: truncating "report.pdf" to "repo" loses what it IS.
+    // Keep the extension: truncating "report.pdf" to "repo" loses what it is.
     const ext = dot > 0 && name.length - dot <= 12 ? name.slice(dot) : "";
     name = name.slice(0, MAX_NAME_CHARS - ext.length) + ext;
   }
@@ -161,16 +149,15 @@ function sanitizeName(raw) {
 }
 
 /// RFC 6266: an ASCII fallback for old clients plus the real UTF-8 name. Quotes and
-/// backslashes are stripped from the fallback so the header cannot be broken out of.
+/// backslashes are stripped from the fallback so nothing can break out of the header.
 function attachmentHeader(name) {
   const safe = name.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "");
   return `attachment; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(name)}`;
 }
 
 /// Own-property lookups only. A plain `TYPE_SIGNATURES[ct]` inherits from Object.prototype,
-/// so a declared type of "constructor" or "valueOf" used to return a FUNCTION here and blow
-/// up on `.every`. Harmless while the allowlist gated which types could reach this; now
-/// that any type can, it would be an uncaught 500 on demand.
+/// so a declared type of "constructor" or "valueOf" returns a function and blows up on
+/// `.every`: any type can reach this, so that's an uncaught 500 on demand.
 function signaturesFor(contentType) {
   return Object.hasOwn(TYPE_SIGNATURES, contentType) ? TYPE_SIGNATURES[contentType] : undefined;
 }
@@ -186,7 +173,7 @@ function matchesMagic(head, contentType) {
 /// Read the first bytes back OUT of R2 and check them against the declared type.
 ///
 /// This happens after the write, not during it, and that is not laziness. R2 will only
-/// accept a FIXED-LENGTH stream, and `request.body` stops being one the moment it is
+/// accept a fixed-length stream, and `request.body` stops being one the moment it is
 /// piped through a TransformStream, so sniffing on the way in costs either the streaming
 /// (buffer the whole file in a 128 MB worker) or the check. Reading 16 bytes back is a
 /// cheap range GET, and a file that fails is deleted before its link ever works.
@@ -206,11 +193,11 @@ async function storedBytesMatchType(env, key, contentType) {
 /// licence key, and it is the only thing that lets an abuse report be traced back to a
 /// sale: we store sha256(key), and a hash cannot be reversed.
 ///
-/// increment_uses_count is FALSE on purpose. The app burns a seat once, at activation
+/// increment_uses_count is false on purpose. The app burns a seat once, at activation
 /// (LicenseManager.activate), and the license allows five devices. Counting again here
 /// would spend the user's seats on our own bookkeeping.
 /// Tries each product in turn and returns the first real answer. "invalid" from the membership
-/// only means "not one of ours from THAT product", so it must fall through to the one-time
+/// only means "not one of ours from that product", so it must fall through to the one-time
 /// product rather than being reported; anything else (active, lapsed, revoked, unreachable) is a
 /// real answer about this key and stops the loop. If every product says invalid, it is invalid.
 async function verifyLicense(key, env) {
@@ -239,8 +226,8 @@ async function verifyLicenseAgainst(key, productID, env) {
   } catch {
     return verdict("unreachable");
   }
-  // 429 is Gumroad rate limiting us, not the user's licence being bad. Treating it as
-  // "invalid" would lock out real buyers whenever we get busy.
+  // 429 is Gumroad rate-limiting us, not a bad licence. Calling it "invalid" would lock out real
+  // buyers whenever we're busy.
   if (response.status === 429 || response.status >= 500) return verdict("unreachable");
 
   let body;
@@ -256,31 +243,24 @@ async function verifyLicenseAgainst(key, productID, env) {
 
   const saleID = typeof purchase.sale_id === "string" ? purchase.sale_id : null;
 
-  // ENTITLEMENT, and the rule is the absence of a field rather than a date. Identical to
-  // mushroom-messaging's copy, and the two MUST agree or a subscriber keeps one feature and
+  // Entitlement. Must match mushroom-messaging's copy, or a subscriber keeps one feature and
   // loses the other.
   //
-  // A one-time purchase carries no `subscription_id`; a membership always does. Both shapes were
-  // captured from the live API on 2026-08-08 and are pinned as tests in
-  // Tests/MushroomPetKitTests/KitTests.swift. So "no subscription_id" means "not a membership",
-  // which is necessary but NOT sufficient: the one-time product is still on sale, so the branch
-  // below still has to date it against the cutover. Do not collapse the two.
+  // A one-time purchase has no `subscription_id`; a membership always does (both shapes
+  // captured from the live API and pinned in Tests/MushroomPetKitTests/KitTests.swift).
+  // "No subscription_id" is necessary but not sufficient: the one-time product is still on sale,
+  // so the branch below dates it against the cutover. Don't collapse the two.
   //
-  // That also grandfathers a self-hosted box for free: `installOfflineGumroad` synthesises a
-  // purchase with no subscription_id, so an air-gapped install entitles itself. Deliberate.
+  // This also grandfathers a self-hosted box on purpose: `installOfflineGumroad` synthesises a
+  // purchase with no subscription_id, so an air-gapped install entitles itself.
   if (typeof purchase.subscription_id !== "string") {
-    // A one-time purchase. Entitled forever ONLY if it predates the cutover.
+    // One-time purchase: entitled forever only if it predates the cutover. Otherwise anyone
+    // could buy the app once and keep Spore Storage for less than four months of membership,
+    // and the one-time listing itself says "File sharing and Friends stay off in that version".
     //
-    // "No subscription_id" alone is not enough, and believing it was would have been a revenue
-    // hole with the shape of a feature: the one-time product is STILL ON SALE, so anyone could
-    // buy the app once and get Spore Storage permanently for less than four months of
-    // membership. The one-time product's own Gumroad listing says so ("File sharing and Friends
-    // stay off in that version"), so this is what makes the code agree with what buyers are told.
-    //
-    // Same cutover, same 0-means-grandfather-everyone default, and therefore the same no-op
-    // deploy as the App Store path. An unparseable or missing date counts as pre-cutover, for
-    // the same asymmetry: wrongly refusing an old buyer breaks something they paid for, wrongly
-    // admitting one costs us a little hosting.
+    // Same cutover and 0-means-grandfather-everyone default as the App Store path. A missing or
+    // unparseable date counts as pre-cutover: wrongly refusing an old buyer breaks something
+    // they paid for, wrongly admitting one costs a little hosting.
     const cutover = Number(env.ENTITLEMENT_CUTOVER ?? 0);
     if (!Number.isFinite(cutover) || cutover <= 0) return verdict("active", saleID, null);
     const soldMs = Date.parse(purchase.sale_timestamp ?? purchase.created_at ?? "");
@@ -290,10 +270,9 @@ async function verifyLicenseAgainst(key, productID, env) {
       : verdict("lapsed", saleID);
   }
 
-  // `subscription_cancelled_at` is deliberately NOT consulted: Gumroad sets it the moment
-  // somebody cancels while the membership still runs to the end of the paid period, and
-  // `subscription_ended_at` is what appears when it actually stops. Treating cancelled as lapsed
-  // would take away time they have already paid for.
+  // `subscription_cancelled_at` is ignored on purpose: Gumroad sets it on cancel while the paid
+  // period still runs; `subscription_ended_at` marks the real stop. Treating cancelled as
+  // lapsed would take away time already paid for.
   if (purchase.subscription_ended_at || purchase.subscription_failed_at) {
     return verdict("lapsed", saleID);
   }
@@ -302,59 +281,50 @@ async function verifyLicenseAgainst(key, productID, env) {
 
 // ---------------------------------------------------------------- app store purchases
 
-// The App Store build has no Gumroad key to present: `LicenseManager`'s APPSTORE stub never
-// writes one. It sends `AppTransaction`'s JWS instead, which Apple signs and documents for
-// exactly this. Everything downstream is unchanged, because the identity below lands in the
-// same `licenses.license_hash` column as a Gumroad key hash.
+// The App Store build has no Gumroad key (`LicenseManager`'s APPSTORE stub never writes one),
+// so it sends `AppTransaction`'s JWS, which Apple signs for exactly this. The identity lands in
+// the same `licenses.license_hash` column as a Gumroad key hash, so nothing downstream changes.
 //
-// The trust anchors live in ONE place, ../worker-shared/apple-roots.js, imported by both
-// workers: they must be rotated in lockstep and nothing here would catch a one-sided edit.
+// Trust anchors live in one place, ../worker-shared/apple-roots.js, shared by both workers so
+// they rotate in lockstep; nothing here would catch a one-sided edit.
 import { APPSTORE_BUNDLE_ID, APPLE_ROOT_CA_G3, APPLE_ROOT_CA_G2 } from "../worker-shared/apple-roots.js";
-// The entitlement RULES live next to them, for the same reason and with the same hazard: the
-// two workers gate different features on one membership, so a rule that differs by a character
-// between them means a subscriber keeps one and loses the other.
+// The entitlement rules are shared for the same reason: the workers gate different features on
+// one membership, so a rule that differs between them keeps one feature and drops the other.
 import { LICENSE_RECHECK_SECONDS, appStoreEntitlement, verifyAppSubscription,
          entitlementMisconfigured,
          SETAPP_RECHECK_SECONDS, setappMisconfigured, verifySetappAccess }
   from "../worker-shared/entitlement.js";
 
-// The JWS is three base64url segments and a signature; a real one is a few KB. Bounded so a
-// megabyte of junk cannot reach the verifier.
+// A real JWS is a few KB. Bounded so a megabyte of junk never reaches the verifier.
 const MAX_APP_TRANSACTION_CHARS = 12000;
 
-// Namespaced away from Gumroad's hash so the two identity spaces can never collide in the
-// one `licenses` table. Apple issues `appTransactionId` per Apple Account AND per family
-// group member, so a Family Sharing member gets their own three seats rather than fighting
-// over the purchaser's.
+// Namespaced so it can't collide with Gumroad hashes in the one `licenses` table. Apple issues
+// `appTransactionId` per Apple Account and per family member, so Family Sharing members get
+// their own seats.
 const appStoreHash = (appTransactionID) => sha256Hex(`appstore:${appTransactionID}`);
 
-// The third identity space. Namespaced away from the other two for the same reason, and computed
-// from `setappUserID`'s canonical decimal string so one account can never hash two ways.
+// Third identity space, namespaced the same way, from `setappUserID`'s canonical decimal string
+// so one account never hashes two ways.
 //
-// Must match messaging-worker's copy EXACTLY: a Setapp subscriber whose two Workers disagreed
-// about their licence hash would keep one hosted feature and lose the other, which is the drift
-// worker-shared/entitlement.js exists to prevent.
+// Must match messaging-worker's copy exactly, or a Setapp subscriber keeps one hosted feature
+// and loses the other.
 const setappHash = (userID) => sha256Hex(`setapp:${userID}`);
 
-/// How many Macs THIS licence row may keep, counted across every row that shares the sale.
+/// How many Macs this licence row may keep, counted across every row sharing the sale.
 ///
-/// One membership sale means five devices IN TOTAL, not five per row, and rows multiply because a
-/// redeeming App Store account gets its own row keyed on its own app transaction while a
-/// direct-build Mac hashes the key itself. Applying this to the redeem branch alone bounded the
-/// redeemers against each other and then handed the ordinary Gumroad branch a full fresh three on
-/// top, so one 3-Mac sale kept six Macs here and six more on mushroom-messaging. Nothing else
-/// bounded it: `verifyLicenseAgainst` sends `increment_uses_count: "false"`, so neither Worker ever
-/// spends a Gumroad seat to find out.
+/// One sale means five devices in total, not per row. Rows multiply: a redeeming App Store
+/// account gets its own row keyed on its app transaction, while a direct-build Mac hashes the
+/// key. Bounding only the redeem branch let one sale keep twice its Macs here and again on
+/// mushroom-messaging, and nothing else catches it since `verifyLicenseAgainst` sends
+/// `increment_uses_count: "false"`.
 ///
-/// Counted in MACS, not in rows. Counting rows capped the number of Apple Accounts while each of
-/// those rows went on to keep its own five devices under the eviction, and it made the client's
-/// sentence ("already set up on five devices") name a unit nothing was counting.
+/// Counted in Macs, not rows: counting rows capped Apple Accounts while each kept five devices,
+/// and the client's "already set up on five devices" would name a unit nothing counted.
 ///
-/// Excludes this hash so re-activating a Mac that is already counted stays free. A response with no
-/// sale id cannot be counted, so it is let through rather than refused (§12 fail-open); the live API
-/// always sends one. Returns null when the sale's seats are already spent, which the caller answers
-/// with `seat_limit` and NEVER `subscription_required`: that code is the one both clients treat as a
-/// final entitlement refusal and persist.
+/// Excludes this hash, so re-activating an already-counted Mac is free. No sale id can't be
+/// counted, so it's let through (§12 fail-open); the live API always sends one. Returns null
+/// when the seats are spent; the caller answers `seat_limit`, never `subscription_required`,
+/// which both clients persist as a final entitlement refusal.
 async function saleSeatBudget(env, saleID, hash) {
   if (!saleID) return MAX_DEVICES_PER_LICENSE;
   const seats = await env.DB.prepare(
@@ -366,61 +336,50 @@ async function saleSeatBudget(env, saleID, hash) {
   return taken >= MAX_DEVICES_PER_LICENSE ? null : MAX_DEVICES_PER_LICENSE - taken;
 }
 
-/// May a credential that verified as this hash enrol on THIS box?
+/// May a credential that verified as this hash enrol on this box?
 ///
-/// Self-hosted only. `ENROLLMENT_HASHES` does not exist hosted, where Gumroad is the enrolment
-/// decision and every paying customer is welcome, so `SELFHOST` unset answers yes to everything
-/// and none of this runs.
+/// Self-hosted only. Hosted, Gumroad decides and every paying customer is welcome, so with
+/// `SELFHOST` unset this answers yes.
 ///
-/// The list USED to be enforced entirely inside the offline Gumroad shim
-/// (selfhost/shared/gumroad.js), which works by wrapping `fetch`, so it only ever saw the
-/// Gumroad branch. An App Store credential verifies against the pinned Apple roots offline and
-/// never calls `fetch`, so it walked straight past a list an operator had set: any App Store
-/// copy of the app could enrol itself on a box restricted to named keys, over an endpoint that
-/// takes no authentication.
+/// The offline Gumroad shim (selfhost/shared/gumroad.js) wraps `fetch`, so it only sees the
+/// Gumroad branch. An App Store credential verifies offline against the pinned Apple roots and
+/// never calls `fetch`, so relying on the shim let any App Store copy enrol on a box
+/// restricted to named keys, over an unauthenticated endpoint.
 ///
-/// Deciding on the DERIVED hash, after whichever branch produced it, is what makes that a class
-/// of bug rather than one instance. It is deliberately NOT written as "refuse App Store
-/// credentials on-prem", which is what the client happens to enforce today: `#if APPSTORE`
-/// blocks custom servers to avoid a review conversation, not because Apple forbids it, so the
-/// day that ships this still works and an operator enrols an App Store user by hash like anyone
-/// else. Gumroad keys pass through it too, which is redundant with the shim and meant to be:
-/// the security boundary should not rest on a `fetch` wrapper.
+/// Deciding on the derived hash, whichever branch produced it, closes the whole class rather
+/// than refusing App Store credentials on-prem: an operator enrols an App Store user by hash
+/// like anyone else. Gumroad keys pass through here too, redundant with the shim on purpose:
+/// the security boundary shouldn't rest on a `fetch` wrapper.
 function enrolmentAllows(hash, env) {
   if (env.SELFHOST !== "1") return true;
   const configured = String(env.ENROLLMENT_HASHES ?? "").trim();
-  // Exactly "*", not a wildcard anywhere in the value, matching the shim: a list that happens to
-  // contain a stray asterisk is a typo, and reading it as "let everybody in" is the wrong way to
-  // resolve one.
+  // Exactly "*", as in the shim: a stray asterisk inside a list is a typo, not "let everyone in".
   if (configured === "*") return true;
-  // Unset is a half-configured box, and it fails closed. The Gumroad branch already answers 503
-  // there because the shim is not installed and the call escapes to a network that refuses it;
-  // this is what stops the App Store branch being the one credential such a box still took.
+  // Unset is a half-configured box and fails closed. The Gumroad branch already 503s there (no
+  // shim, the call escapes to a network that refuses it); this stops the App Store branch being
+  // the one credential such a box still accepts.
   return configured.split(/[\s,]+/).filter(Boolean).some((h) => h.toLowerCase() === hash);
 }
 
 // One verifier per environment, built once per isolate and reused.
 //
-// Not just to skip re-parsing the two DER roots: `SignedDataVerifier` carries its own
-// verified-public-key cache (15 min, 32 entries) that is PER INSTANCE, so constructing a
-// fresh one per request threw it away and made every activation redo the whole chain walk,
-// even though one Apple leaf signs everybody's JWS in a given window.
+// Beyond skipping the DER parse: `SignedDataVerifier` has a per-instance verified-key cache
+// (15 min, 32 entries). A fresh one per request throws it away and redoes the chain walk on
+// every activation, though one Apple leaf signs everybody's JWS in a given window.
 let verifierCache = null;
 
 async function appStoreVerifiers(appAppleID) {
   if (verifierCache) return verifierCache;
-  // Imported HERE rather than at the top of the file, and that is load-bearing: jsrsasign
-  // generates random values while its module body runs, and workerd forbids that in global
-  // scope, so a top-level import stops the Worker booting outright with "Disallowed
-  // operation called within global scope". Inside a handler it is fine. The runtime caches
-  // the evaluation, so this costs ~80 ms once per cold isolate and nothing after that.
+  // Imported here, not at the top, and that's load-bearing: jsrsasign generates random values
+  // in its module body, which workerd forbids in global scope ("Disallowed operation called
+  // within global scope"), so a top-level import stops the Worker booting. The evaluation is
+  // cached, so it costs ~80 ms once per cold isolate.
   const lib = await import("@apple/app-store-server-library");
   const roots = [APPLE_ROOT_CA_G3, APPLE_ROOT_CA_G2].map((b64) => Buffer.from(b64, "base64"));
-  // Production first, then Sandbox. A build from TestFlight or from App Review carries a
-  // Sandbox transaction, so refusing those would fail review. `enableOnlineChecks` is off so
-  // activation never waits on an OCSP round trip; the chain is still verified to the root.
-  // Xcode and LocalTesting are deliberately absent: the library skips signature verification
-  // entirely for those, so accepting them would make this endpoint forgeable.
+  // Production, then Sandbox: TestFlight and App Review builds carry Sandbox transactions, and
+  // refusing them would fail review. `enableOnlineChecks` is off so activation never waits on
+  // OCSP; the chain is still verified to the root. Xcode and LocalTesting are left out because
+  // the library skips signature checks for them, which would make this endpoint forgeable.
   verifierCache = [
     new lib.SignedDataVerifier(roots, false, lib.Environment.PRODUCTION, APPSTORE_BUNDLE_ID, appAppleID),
     new lib.SignedDataVerifier(roots, false, lib.Environment.SANDBOX, APPSTORE_BUNDLE_ID, undefined),
@@ -432,21 +391,19 @@ async function appStoreVerifiers(appAppleID) {
 /// Returns `{ status, appTransactionID, originalPurchaseMs }` where status is
 /// "active" | "invalid" | "unconfigured".
 ///
-/// There is deliberately no "unreachable": the JWS carries its own certificate chain and is
-/// checked against a pinned root, so unlike the Gumroad path there is no third party who can
-/// be down. "unconfigured" is our own missing app id, not the user's problem.
+/// No "unreachable": the JWS carries its own chain, checked against a pinned root, so there's
+/// no third party to be down. "unconfigured" is our missing app id, not the user's problem.
 async function verifyAppTransaction(jws, env) {
   const verdict = (status, appTransactionID = null, originalPurchaseMs = null) =>
     ({ status, appTransactionID, originalPurchaseMs });
 
-  // Shape first, crypto second. Verification is the expensive part of this endpoint, and it
-  // is unauthenticated by nature, so anything obviously not a JWS is rejected before it can
-  // cost anything.
+  // Shape before crypto: verification is the expensive part of an unauthenticated endpoint, so
+  // anything obviously not a JWS is rejected for free.
   if (!/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(jws)) return verdict("invalid");
 
-  // Apple's verifier requires the numeric App Store id for PRODUCTION. It only exists once
-  // the App Store Connect record does, so it lives in a var: refuse loudly while it is
-  // missing rather than quietly verify against the wrong app.
+  // Apple's verifier needs the numeric App Store id for Production. It's a var because it only
+  // exists once the App Store Connect record does; refuse loudly while it's missing rather
+  // than verify against the wrong app.
   const appAppleID = Number(env.APPSTORE_APP_APPLE_ID ?? 0);
   if (!Number.isFinite(appAppleID) || appAppleID <= 0) return verdict("unconfigured");
 
@@ -462,21 +419,19 @@ async function verifyAppTransaction(jws, env) {
   for (const verifier of verifiers) {
     try {
       const tx = await verifier.verifyAndDecodeAppTransaction(jws);
-      // The verifier already rejected a mismatched bundleId. `appTransactionId` is the part
-      // we actually need, and it is optional in the model, so an answer without one is no
-      // use to us as an identity.
+      // The verifier already checked bundleId. `appTransactionId` is what we need and it's
+      // optional in the model; without it there's no identity.
       if (typeof tx.appTransactionId === "string" && tx.appTransactionId) {
-        // Ms since epoch, when this Apple Account FIRST bought the app. Optional in Apple's
-        // model, and a null must never read as "bought recently": see appStoreEntitlement.
+        // Ms since epoch when this Apple Account first bought the app. Optional, and null must
+        // never read as "bought recently": see appStoreEntitlement.
         const bought = typeof tx.originalPurchaseDate === "number" ? tx.originalPurchaseDate : null;
         return verdict("active", tx.appTransactionId, bought);
       }
       failures.push("no_app_transaction_id");
     } catch (error) {
-      // Wrong environment is the ordinary case (every Sandbox JWS fails Production first),
-      // so this is not an error on its own. Logged because the alternative is that a wrong
-      // but numeric APPSTORE_APP_APPLE_ID fails EVERY customer with nothing in the logs to
-      // tell a total outage apart from ordinary junk traffic.
+      // Wrong environment is normal (every Sandbox JWS fails Production first). Logged anyway,
+      // because a wrong but numeric APPSTORE_APP_APPLE_ID would fail every customer with
+      // nothing to tell a total outage from junk traffic.
       failures.push(error?.status ?? error?.name ?? "unknown");
     }
   }
@@ -486,19 +441,19 @@ async function verifyAppTransaction(jws, env) {
 
 // ---------------------------------------------------------------- throttle
 
-const ACTIVATIONS_PER_MINUTE_PER_IP = 30;
+// Overridable for self-hosted boxes, where every client shares one bucket (see the activate
+// route); hosted keeps the default.
+const activationsPerMinutePerIP = (env) => Number(env.ACTIVATIONS_PER_MINUTE_PER_IP ?? 30) || 30;
 
 /// True if this request is within the limit, false if it should be refused.
 ///
-/// One statement, using RETURNING, so it costs a single D1 round trip. Deliberately NOT
-/// Cloudflare's Rate Limiting binding: that was tried first and measured not to enforce for
-/// this account (139 requests from one IP in a minute against a 30/60s limit, every one
-/// answered success), and a limiter that always says yes is worse than none because the
-/// endpoint reads as protected. See migrations/0004_throttle.sql.
+/// One statement with RETURNING, so a single D1 round trip. Not Cloudflare's Rate Limiting
+/// binding: measured on this account, it let 139 requests from one IP through in a minute
+/// against a 30/60s limit, and a limiter that always says yes is worse than none because the
+/// endpoint looks protected. See migrations/0004_throttle.sql.
 ///
-/// FAILS OPEN on a D1 error, matching §14 and `requireLicense`: this bounds an abuse cost,
-/// it is not an authorization decision, and refusing every activation because D1 blipped
-/// would be the worse failure.
+/// Fails open on a D1 error, like §14 and `requireLicense`: it bounds an abuse cost, it isn't
+/// authorization, and refusing every activation over a D1 blip would be worse.
 async function throttle(env, name, key, limit, windowSeconds) {
   const window = Math.floor(now() / windowSeconds) * windowSeconds;
   try {
@@ -516,30 +471,24 @@ async function throttle(env, name, key, limit, windowSeconds) {
 
 // ---------------------------------------------------------------- auth
 
-/// `allowExpired` drops ONLY the entitlement clause, never the device or revocation checks.
+/// `allowExpired` drops only the entitlement clause, never the device or revocation checks.
 ///
-/// It exists for `releaseDevice`, whose contract (see `requireLicense` below) is that "releasing
-/// your own Mac is cleanup, not access". That exemption was written against `requireLicense`, but
-/// the entitlement clause landed here instead, in front of every /v1/ route, so a lapsed member
-/// got 401 on the one call that hands their seat back: `switchServers` could not release, and the
-/// seat stayed occupied until LRU eviction. Cleanup has to keep working after the horizon passes,
-/// or the seat cap becomes a trap.
+/// It's for `releaseDevice`: "releasing your own Mac is cleanup, not access" (see
+/// `requireLicense`). The entitlement clause sits in front of every /v1/ route, so without this
+/// a lapsed member gets 401 on the one call that hands their seat back (`switchServers` can't
+/// release) and the seat stays taken until LRU eviction, turning the cap into a trap.
 async function authenticate(request, env, ctx, { allowExpired = false, touch = true } = {}) {
   const header = request.headers.get("authorization") ?? "";
   if (!header.startsWith("Bearer ")) return null;
   const tokenHash = await sha256Hex(header.slice(7).trim());
 
-  // One round trip, not two. Every /v1/ request pays this, so the second sequential D1
-  // query was pure latency on the upload path. An INNER JOIN is the same answer as the two
-  // lookups it replaces: no row when the device is missing or revoked, and no row when it
-  // has no licence, both of which were already `return null`.
+  // One round trip, since every /v1/ request pays it: the INNER JOIN yields no row for a
+  // missing or revoked device or a missing licence.
   //
-  // The entitlement clause is what makes a subscription actually recur, and it reuses machinery
-  // that already exists rather than adding a timer. An expired row yields no auth row, which is
-  // already `return null`, which is already a 401, which the client already handles by deleting
-  // its token and re-activating (FileShareService.swift, the .reactivate branch). Re-activation
-  // is a real Gumroad or Apple call, so it either extends the horizon or answers 403
-  // subscription_required. Nothing polls, and nothing had to be built to make it recur.
+  // The entitlement clause is what makes a subscription recur, with no timer: an expired row
+  // gives no auth row, so a 401, so the client re-activates (FileShareService.swift, the
+  // .reactivate branch). Re-activation is a real Gumroad or Apple call that either extends the
+  // horizon or answers 403 subscription_required. Nothing polls.
   //
   // NULL passes forever: `entitled_until IS NULL` is the grandfathered case.
   const row = await env.DB.prepare(
@@ -550,10 +499,9 @@ async function authenticate(request, env, ctx, { allowExpired = false, touch = t
   ).bind(...(allowExpired ? [tokenHash] : [tokenHash, now()])).first();
   if (!row) return null;
 
-  // NOT when the caller is only asking WHY a request failed (`refusal`). `last_seen_at` is what
-  // the seat eviction orders by, so bumping it for a request we are about to 401 let a device
-  // that only ever 401s sit permanently at the top of the LRU and evict a healthy but quieter
-  // Mac, and it spent a D1 write per refused request on top of the read.
+  // Not when the caller only asks why a request failed (`refusal`). Seat eviction orders by
+  // `last_seen_at`, so bumping it for a request we're about to 401 keeps a device that only
+  // 401s at the top of the LRU, evicting a healthy quieter Mac, and costs a D1 write besides.
   if (touch) {
     ctx.waitUntil(
       env.DB.prepare("UPDATE devices SET last_seen_at = ? WHERE id = ?").bind(now(), row.device_id).run()
@@ -568,14 +516,12 @@ async function authenticate(request, env, ctx, { allowExpired = false, touch = t
 
 /// The 401 to send, once `authenticate` has already said no.
 ///
-/// Two different refusals wear this status: an unknown or revoked token ("activate again"), and a
-/// LIVE token whose licence is merely past its horizon ("somebody has to re-prove this licence").
-/// The Mac can always do the second itself, so the distinction changes nothing here today; it is
-/// sent because the two Workers answer the same vocabulary, and `FileShare.classify` reads it.
-/// Costs one extra read, only on a path that has already failed. `touch: false` because this
-/// request is being refused: recording it as activity would keep a device that only ever 401s at
-/// the head of the eviction LRU. Older clients read any 401 as `reactivate`, which is the old
-/// behaviour exactly. Mirrors mushroom-messaging's `refusal`.
+/// Two refusals share this status: an unknown or revoked token ("activate again"), and a live
+/// token whose licence is past its horizon ("someone must re-prove this licence"). A Mac can
+/// always do the second itself, but both Workers speak the same vocabulary and
+/// `FileShare.classify` reads it. One extra read, only on a path that already failed.
+/// `touch: false` so a device that only 401s doesn't sit at the head of the eviction LRU.
+/// Older clients read any 401 as `reactivate`. Mirrors mushroom-messaging's `refusal`.
 async function refusal(request, env, ctx) {
   const stillValid = await authenticate(request, env, ctx, { allowExpired: true, touch: false });
   return stillValid ? fail(401, "entitlement_lapsed") : fail(401, "reactivate");
@@ -590,30 +536,26 @@ async function activateDevice(request, env) {
   } catch {
     return fail(400, "bad_request");
   }
-  // `JSON.parse("null")` SUCCEEDS, so the catch above never fires for a body of `null` and
-  // the property reads below would throw a 500. Same for a bare string or array.
+  // `JSON.parse("null")` succeeds, so the catch misses a `null` body and the reads below would
+  // throw a 500. Same for a bare string or array.
   if (!body || typeof body !== "object" || Array.isArray(body)) return fail(400, "bad_request");
-  // Exactly one credential. Both set is a client bug, and silently picking a winner is how
-  // an App Store build ends up authenticating as somebody else's Gumroad licence.
   const key = typeof body.license_key === "string" ? body.license_key.trim() : "";
   const jws = typeof body.app_transaction === "string" ? body.app_transaction.trim() : "";
-  // An entitlement proof, NOT a credential: deliberately absent from the "exactly one credential"
-  // check below, exactly like migrate_app_transaction. It never decides identity, only how long.
+  // An entitlement proof, not a credential (like migrate_app_transaction), so it's left out of
+  // the one-credential check. It decides how long, never who.
   const subJWS = typeof body.app_subscription === "string" ? body.app_subscription.trim() : "";
   // A Gumroad membership key entered in the App Store build under "Already subscribed
-  // elsewhere?". Also an entitlement proof and NEVER a credential: it is deliberately not part of
-  // the one-credential check, and `hash` is never derived from it. Deriving identity from it
-  // would drag every redeeming Mac through the migration path on every activation and move its
-  // friendships to a different licence.
+  // elsewhere?". Also only an entitlement proof; `hash` is never derived from it, or every
+  // redeeming Mac would move to a different licence on each activation.
   const redeemKey = typeof body.redeem_license_key === "string" ? body.redeem_license_key.trim() : "";
-  // The Setapp build's proof: a single-use authorization code, exchanged with Setapp's Vendor API
-  // below. A CREDENTIAL, unlike the two proofs above, because the licence hash comes from it.
+  // The Setapp build's single-use authorization code, exchanged with Setapp's Vendor API below.
+  // A credential, since the licence hash comes from it.
   //
-  // No `link_code` here, unlike mushroom-messaging. That one exists so a PHONE can join a licence,
-  // and the phone has no Spore Storage: there is no FileShareClient in the iOS target, so a code
-  // minted here would be carried and expired with nothing able to redeem it.
+  // No `link_code`, unlike mushroom-messaging: that lets a phone join a licence, and the phone
+  // has no Spore Storage (no FileShareClient in the iOS target), so nothing could redeem one.
   const setappCode = typeof body.setapp_code === "string" ? body.setapp_code.trim() : "";
-  // Exactly one of the three. `!key === !jws` said this for two and does not scale.
+  // Exactly one of the three. Silently picking a winner is how one build ends up
+  // authenticating as somebody else's licence.
   if ([key, jws, setappCode].filter(Boolean).length !== 1) return fail(400, "bad_request");
   if (setappCode && setappCode.length > 512) return fail(400, "bad_request");
   if (key && key.length > 100) return fail(400, "bad_request");
@@ -625,19 +567,17 @@ async function activateDevice(request, env) {
   let hash;
   let saleID = null;
   let source;
-  // NULL means entitled forever, and it is the default for a reason: every path that does not
-  // deliberately set a horizon is a grandfathered one.
+  // NULL means entitled forever: any path that doesn't set a horizon is grandfathered.
   let entitledUntil = null;
-  // How many Macs THIS row may keep once it is written. Only the redeem path lowers it, so
-  // that one membership sale means five devices in total rather than five per Apple Account:
-  // see the seat cap below and the eviction that spends this budget.
+  // How many Macs this row may keep once written. The redeem and Gumroad branches lower it, so
+  // one sale means five devices in total, not five per Apple Account (see `saleSeatBudget` and
+  // the eviction). Setapp counts devices itself.
   let deviceBudget = MAX_DEVICES_PER_LICENSE;
 
-  // BEFORE either credential branch, because the hazard is what gets WRITTEN below rather than
-  // which door it came through. Both entitlement rules answer NULL when the cutover is missing,
-  // and NULL on a row that does not exist yet is permanent: the INSERT writes it and the upsert's
-  // first CASE clause then pins it. Fails soft with 503 rather than minting that. See
-  // `entitlementMisconfigured`; a self-hoster sets neither var and never reaches it.
+  // Before either credential branch, because the hazard is what gets written, not which door it
+  // came through. Both entitlement rules answer NULL when the cutover is missing, and NULL on a
+  // new row is permanent: the INSERT writes it and the upsert's first CASE pins it. So 503
+  // instead. See `entitlementMisconfigured`; a self-hoster sets neither var and never hits it.
   if (entitlementMisconfigured(env)) return fail(503, "appstore_unconfigured");
 
   if (jws) {
@@ -647,85 +587,75 @@ async function activateDevice(request, env) {
     hash = await appStoreHash(appTransactionID);
     source = "appstore";
     entitledUntil = appStoreEntitlement(originalPurchaseMs, env);
-    // "lapsed" here only means "bought after the cutover", which is not yet a refusal: a live
-    // subscription is the other way to be entitled. Grandfathered buyers never reach this at all,
-    // which is why a missing subscription is not an error for them.
+    // "lapsed" here only means "bought after the cutover", not yet a refusal: a live
+    // subscription is the other way in. Grandfathered buyers never get here.
     if (entitledUntil === "lapsed") {
       const sub = subJWS
-        // `appStoreVerifiers` is passed in: it does a bare dynamic import of
-        // @apple/app-store-server-library, which is declared in THIS worker's package.json, so it
-        // has to stay on this side of the shared module. See worker-shared/entitlement.js.
+        // `appStoreVerifiers` is passed in because its dynamic import of
+        // @apple/app-store-server-library resolves against this worker's package.json. See
+        // worker-shared/entitlement.js.
         ? await verifyAppSubscription(subJWS, env, appTransactionID, appStoreVerifiers)
         : { status: "invalid", entitledUntil: null };
       if (sub.status !== "active") {
-        // No StoreKit subscription. A membership bought on the website is the other way to be
-        // entitled (guideline 3.1.3(b), permitted because the same membership is also an in-app
-        // purchase). Verified with the ORDINARY Gumroad path and the ordinary entitlement rule,
-        // and used ONLY for the horizon.
+        // No StoreKit subscription. A website membership is the other way in (guideline
+        // 3.1.3(b), allowed because the same membership is also an in-app purchase). Verified
+        // with the ordinary Gumroad path and rule, and used only for the horizon.
         const redeemed = redeemKey ? await verifyLicense(redeemKey, env) : { status: "unset" };
-        // "unreachable" is Gumroad being down, NOT this person being unentitled. The primary
-        // Gumroad branch below says "FAIL CLOSED here, and only here" and answers 503; collapsing
-        // it into a 403 here made a third-party rate limit revoke a paid feature, which the
-        // client then LATCHES (markNotEntitled / markNoServerFeatures). §12 forbids exactly that.
+        // "unreachable" is Gumroad down, not this person unentitled. A 403 here would let a
+        // third-party rate limit revoke a paid feature, which the client then latches
+        // (markNotEntitled / markNoServerFeatures). §12 forbids that.
         if (redeemed.status === "unreachable") return fail(503, "gumroad_down");
-        // A MEMBERSHIP, not any old key. `verifyLicense` tries both products, so without this a
-        // one-time $9.99 key returned `active` with a null horizon, which the upsert's
-        // once-forever CASE then pinned as permanent and irreversible, on unlimited App Store
-        // accounts, with no seat spent (increment_uses_count is false on this path). A null
-        // horizon here means "not a membership" and must be refused.
+        // A membership, not any key. `verifyLicense` tries both products, so a one-time key comes
+        // back `active` with a null horizon, which the upsert's once-forever CASE would pin as
+        // permanent, on unlimited App Store accounts, spending no seat. Null here means "not a
+        // membership".
         if (redeemed.status !== "active" || redeemed.entitledUntil === null) {
-          // Only NOW is the missing product-id config fatal: an unconfigured deployment must not
-          // preempt a perfectly good website membership.
+          // Only now is missing product-id config fatal: it must not preempt a good website
+          // membership.
           if (sub.status === "unconfigured") return fail(503, "appstore_unconfigured");
           return fail(403, "subscription_required");
         }
-        // SEAT CAP, the same three the licence is sold with. NOTHING else bounded this path:
-        // it spends no Gumroad seat (`increment_uses_count` is false here) and every Apple
-        // Account gets its own `licenses` row keyed on its own app transaction, so one key
-        // posted publicly entitled an unbounded number of accounts, each with its own three
-        // devices. See `saleSeatBudget`, which the ordinary Gumroad branch below now shares:
-        // capping only here bounded the redeemers against each other and then let the same sale
-        // take a full fresh three through the other door.
+        // Seat cap. Nothing else bounds this path: it spends no Gumroad seat and each Apple
+        // Account gets its own `licenses` row, so one key posted publicly would entitle unlimited
+        // accounts. `saleSeatBudget` is shared with the Gumroad branch so the same sale can't
+        // take a fresh allowance through the other door.
         const budget = await saleSeatBudget(env, redeemed.saleID, hash);
         if (budget === null) return fail(403, "seat_limit");
         deviceBudget = budget;
         entitledUntil = redeemed.entitledUntil;
-        // Recorded so the NEXT redeemer is counted against this sale. Without it every row
-        // stayed anonymous and the cap above could never see anybody.
+        // Recorded so the next redeemer counts against this sale; anonymous rows are invisible
+        // to the cap.
         saleID = redeemed.saleID;
       } else {
         entitledUntil = sub.entitledUntil;
       }
     }
-    // No revoked branch: an Apple refund is not visible from here. Catching one needs App
-    // Store Server Notifications V2 and a webhook, and §14 says fail open and do not build
-    // DRM until piracy is a real problem. The quotas bound the damage either way.
+    // No revoked branch: Apple refunds aren't visible here. That needs App Store Server
+    // Notifications V2 and a webhook, and §14 says fail open, no DRM until piracy is real. The
+    // quotas bound the damage.
   } else if (setappCode) {
-    // Setapp, verified inline and forgotten: the code is exchanged, the answer is written as a
-    // horizon, and no token is stored. The next check happens because that horizon expires and the
-    // client activates again with a code it fetched a moment earlier. See the twin branch in
-    // mushroom-messaging, which this must keep agreeing with.
+    // Setapp, verified inline and forgotten: the answer becomes a horizon and no token is
+    // stored. When it expires, the client activates again with a fresh code. Must keep agreeing
+    // with the twin branch in mushroom-messaging.
     if (setappMisconfigured(env)) return fail(503, "setapp_unconfigured");
     const { status, userID } = await verifySetappAccess(setappCode, env);
-    // Same fail-closed rule as the Gumroad branch below: an issued token keeps working while the
-    // vendor is unreachable, but a NEW one is not handed out on a shrug.
+    // Fail closed, as in the Gumroad branch: existing tokens keep working while Setapp is down,
+    // but a new one isn't handed out on a shrug.
     if (status === "unreachable") return fail(503, "setapp_down");
     if (status === "invalid") return fail(403, "bad_license");
     if (status === "refused") return fail(403, "subscription_required");
 
     hash = await setappHash(userID);
     source = "setapp";
-    // NEVER null: a null horizon is permanent (the upsert's CASE pins it), and a subscription
-    // that can be cancelled tomorrow must never be written as entitled forever.
+    // Never null: a null horizon is permanent (the upsert's CASE pins it), and a cancellable
+    // subscription must never be written as entitled forever.
     entitledUntil = stamp + SETAPP_RECHECK_SECONDS;
-    // No seat budget lowering: Setapp counts devices itself, per purchase.
+    // No seat budget: Setapp counts devices itself, per purchase.
   } else {
     const { status: verdict, saleID: gumroadSaleID, entitledUntil: until } = await verifyLicense(key, env);
-    // FAIL CLOSED here, and only here. The app's own licence gate fails OPEN by design
-    // (CLAUDE.md §12: never lock a paying user out for being offline) and an already
-    // issued device token keeps working while Gumroad is down, see requireLicense below.
-    // But handing out a NEW token without checking would make "Gumroad is unreachable"
-    // a free pass into the bucket for anyone.
+    // Fail closed here, and only here. The app's licence gate fails open (CLAUDE.md §12) and an
+    // issued token keeps working while Gumroad is down (see requireLicense), but a new token
+    // without a check would make "Gumroad is unreachable" a free pass into the bucket.
     if (verdict === "unreachable") return fail(503, "gumroad_down");
     if (verdict === "invalid") return fail(403, "bad_license");
 
@@ -734,18 +664,16 @@ async function activateDevice(request, env) {
     source = "gumroad";
     entitledUntil = until;
 
-    // A real key whose membership has stopped. Distinct from "revoked" on purpose: nothing was
-    // refunded and nothing is being punished, so the row keeps its status and the app keeps its
-    // key. Paying again makes the very next activation succeed with nothing to re-enter.
+    // A real key whose membership stopped. Not "revoked": nothing was refunded, so the row keeps
+    // its status and the app its key, and paying again makes the next activation just work.
     if (verdict === "lapsed") return fail(403, "subscription_required");
 
     if (verdict === "revoked") {
       await env.DB.prepare(
-        // Same CASE as the active upsert below, and for the same reason. Writing 'revoked'
-        // unconditionally LAUNDERED an admin block: 'blocked' became 'revoked', and then a
-        // reversed refund let the next activation promote that row all the way back to
-        // 'active', because the CASE below only ever protected 'blocked'. Neither worker has
-        // an unblock endpoint, so that was the only way a block ever cleared, by accident.
+        // Same CASE as the active upsert below. Writing 'revoked' unconditionally would launder
+        // an admin block: 'blocked' becomes 'revoked', and a reversed refund then lets the next
+        // activation promote it to 'active', since that CASE only protects 'blocked'. With no
+        // unblock endpoint, a block must only ever clear on purpose.
         "INSERT INTO licenses (license_hash, status, checked_at, created_at) VALUES (?, 'revoked', ?, ?) " +
         "ON CONFLICT(license_hash) DO UPDATE SET " +
         "status = CASE WHEN licenses.status = 'blocked' THEN 'blocked' ELSE 'revoked' END, " +
@@ -754,43 +682,34 @@ async function activateDevice(request, env) {
       return fail(403, "revoked");
     }
 
-    // The SAME cap the redeem branch applies, and the reason it is a shared helper. This branch
-    // used to keep a full `MAX_DEVICES_PER_LICENSE` of its own on top of whatever the redeemers
-    // had already taken from the same sale, because the eviction below is scoped to
-    // `license_hash` alone and a direct-build Mac hashes the key while a redeeming Apple Account
-    // hashes its app transaction. One 3-Mac sale therefore kept six Macs. Placed after the
-    // revoked branch so a refused key never spends a query.
+    // The same cap as the redeem branch. The eviction below is scoped to `license_hash`, and a
+    // direct-build Mac hashes the key while a redeeming Apple Account hashes its transaction, so
+    // without this one sale gets a full allowance per door. After the revoked branch so a refused
+    // key costs no query.
     const budget = await saleSeatBudget(env, saleID, hash);
     if (budget === null) return fail(403, "seat_limit");
     deviceBudget = budget;
   }
 
-  // BOTH branches, on the hash whichever one produced, and BEFORE the upsert below so a refused
-  // credential leaves no `licenses` row behind. See enrolmentAllows: the same 403 a key that is
-  // not on the list already gets from the shim, so the two paths answer alike.
+  // Every branch, on whichever hash it produced, and before the upsert so a refused credential
+  // leaves no `licenses` row. See enrolmentAllows; same 403 the shim gives an unlisted key.
   if (!enrolmentAllows(hash, env)) return fail(403, "bad_license");
 
-  // COALESCE, not overwrite: a later verify that happens to omit the sale id must not
-  // erase one we already recorded.
+  // COALESCE, not overwrite: a later verify that omits the sale id mustn't erase ours.
   //
-  // ONCE FOREVER, ALWAYS FOREVER, and now MONOTONIC IN BOTH DIRECTIONS: a NULL `entitled_until`
-  // can never be replaced by a horizon, and a horizon can never be replaced by NULL either. Only
-  // horizon -> horizon moves, which is what a renewal is.
+  // `entitled_until` is monotonic both ways: NULL never becomes a horizon, and a horizon never
+  // becomes NULL. Only horizon -> horizon moves, which is a renewal.
   //
-  // The second clause is the newer half. Permitting horizon -> NULL made an ordinary config slip
-  // irreversible: `appStoreEntitlement()` answers NULL whenever ENTITLEMENT_CUTOVER is absent, 0
-  // or unparseable, and `vars` are replaced wholesale on every `wrangler deploy`, so one deploy
-  // from a config missing the var (it ships commented out) silently promoted every subscriber who
-  // activated during that window to permanent, with the first clause then locking them there.
-  // Nothing in a later deploy could undo it; hand-written SQL against production was the only
-  // recovery. Deliberately grandfathering an existing horizon row is now that same manual act,
-  // which is the right price for making the accident impossible.
+  // Horizon -> NULL would make a config slip irreversible: `appStoreEntitlement()` answers NULL
+  // when ENTITLEMENT_CUTOVER is absent, 0 or unparseable, and `wrangler deploy` replaces `vars`
+  // wholesale, so one deploy missing the var (it ships commented out) would make every subscriber
+  // activating in that window permanent, with no fix but hand-written SQL in production.
+  // Grandfathering a horizon row on purpose is that same manual act, a fair price.
   //
-  // The first clause is what makes grandfathering irreversible: it holds even if a later build
-  // computes the wrong horizon, even if someone flips the cutover by mistake, and even if Gumroad
-  // transiently omits `subscription_id`. Every row that existed when the migration ran is NULL,
-  // so every user who had ever activated is grandfathered with no backfill and no date
-  // arithmetic at all.
+  // NULL -> horizon being impossible is what makes grandfathering stick, even if a later build
+  // computes the wrong horizon, someone flips the cutover, or Gumroad briefly omits
+  // `subscription_id`. Every row that existed at the migration is NULL, so every earlier user is
+  // grandfathered with no backfill or date math.
   await env.DB.prepare(
     "INSERT INTO licenses (license_hash, status, checked_at, created_at, gumroad_sale_id, source, entitled_until) " +
     "VALUES (?, 'active', ?, ?, ?, ?, ?) " +
@@ -804,24 +723,20 @@ async function activateDevice(request, env) {
     "ELSE excluded.entitled_until END"
   ).bind(hash, stamp, stamp, saleID, source, entitledUntil).run();
 
-  // An admin block must not be undone by the next activation. It used to be, because this
-  // upsert wrote 'active' unconditionally: the app re-activated and sharing resumed with a
-  // fresh token. Survivable for a Gumroad key, where revoking at Gumroad makes
-  // `verifyLicense` answer revoked on the next call; for an App Store hash there is no such
-  // lever, because this Worker never re-asks Apple.
+  // The next activation must not undo an admin block, or the app re-activates and sharing
+  // resumes with a fresh token. A Gumroad key could be revoked at Gumroad instead; an App
+  // Store hash has no such lever, since this Worker never re-asks Apple.
   const state = await env.DB.prepare("SELECT status FROM licenses WHERE license_hash = ?")
     .bind(hash).first();
   if (state?.status !== "active") return fail(403, "revoked");
 
-  // THIS Mac's own previous row goes first, and that is what makes a re-activation a reclaim
-  // rather than a second seat. The client sends the device id it already holds, so the row it is
-  // replacing is identifiable; without it the caller's stale row was indistinguishable from
-  // another Mac's, the eviction below counted it as live, and a three-Mac licence lost a healthy
-  // Mac every time one of them re-activated. Routine now rather than rare, because the
-  // entitlement horizon expires every LICENSE_RECHECK_SECONDS and 401s until the Mac re-activates.
+  // This Mac's previous row goes first, making a re-activation a reclaim, not a second seat. The
+  // client sends the device id it holds; otherwise its stale row looks like another Mac's, the
+  // eviction counts it as live, and a healthy Mac is evicted on every re-activation. That's
+  // routine: the horizon expires every LICENSE_RECHECK_SECONDS.
   //
-  // Scoped to THIS licence hash, so a device id lifted from somewhere else cannot revoke another
-  // licence's Mac. An id we do not recognise simply matches nothing.
+  // Scoped to this licence hash, so a lifted device id can't revoke another licence's Mac. An
+  // unknown id matches nothing.
   const priorID = typeof body.device_id === "string" ? body.device_id.slice(0, 64) : null;
   if (priorID) {
     await env.DB.prepare(
@@ -829,9 +744,8 @@ async function activateDevice(request, env) {
     ).bind(stamp, priorID, hash).run();
   }
 
-  // Past the cap, evict the least-recently-seen Mac rather than refusing. A 409 would
-  // strand someone who reinstalled twice, and the evicted Mac silently re-activates the
-  // next time it sees a 401.
+  // Past the cap, evict the least-recently-seen Mac rather than refuse: a 409 would strand
+  // someone who reinstalled twice, and the evicted Mac re-activates on its next 401.
   const live = await env.DB.prepare(
     "SELECT id FROM devices WHERE license_hash = ? AND revoked_at IS NULL ORDER BY last_seen_at DESC"
   ).bind(hash).all();
@@ -850,54 +764,49 @@ async function activateDevice(request, env) {
     "INSERT INTO devices (id, license_hash, token_hash, name, created_at, last_seen_at) VALUES (?,?,?,?,?,?)"
   ).bind(id, hash, await sha256Hex(token), name, stamp, stamp).run();
 
-  // The limits travel with the token so the app renders "up to 95 MB" from the server's
-  // answer. Changing a limit then needs no app release.
+  // The limits travel with the token so the app shows "up to 95 MB" from the server's answer,
+  // and changing a limit needs no app release.
   return reply(201, { device_id: id, token, limits: limits() });
 }
 
 const limits = () => ({
-  // Which wire contract this server speaks. Same rule as mushroom-messaging: emitted now and
-  // read by nobody yet, because absent means "older than 1" and the field therefore has to
-  // exist before there is a 2 or it can never date a pinned customer server. Bump only for a
-  // change an older app cannot survive; additive ones already degrade to unchanged.
+  // The wire contract this server speaks, as in mushroom-messaging. Nobody reads it yet, but
+  // absent means "older than 1", so it must exist before there's a 2 to date a pinned customer
+  // server. Bump only for changes an older app can't survive.
   protocol: 1,
   max_file_bytes: MAX_FILE_BYTES,
   max_files: MAX_ACTIVE_FILES_PER_LICENSE,
   max_total_bytes: MAX_ACTIVE_BYTES_PER_LICENSE,
   ttl_seconds: TTL_SECONDS,
-  // No allowed_types any more: every type is allowed, so there is nothing to enumerate.
-  // Apps from before 1.26 read its absence as "the server did not say" and keep their own
-  // hardcoded list, which is exactly the behaviour they had, so they degrade to unchanged.
-  // The app holds the licence key and we do not, so re-verification is its job. This is
-  // the server telling it how often: re-activate once a token is older than this and a
-  // refunded purchase stops working. See requireLicense.
+  // No allowed_types: every type is allowed. Apps before 1.26 read its absence as "the server
+  // didn't say" and keep their own hardcoded list, so they behave as before.
+  // The app holds the licence key and we don't, so re-verification is its job; this says how
+  // often. Re-activating past this age is what makes a refund stop working. See
+  // requireLicense.
   reverify_after_seconds: LICENSE_RECHECK_SECONDS,
 });
 
-/// Revocation check for an already-authenticated device. Unlike activation this fails
-/// OPEN: the device proved itself once, and Gumroad being down must not stop someone
-/// sharing a file. Only an explicit refund/dispute/chargeback closes the door.
+/// Revocation check for an authenticated device. Unlike activation it fails open: the device
+/// proved itself once, and Gumroad being down mustn't stop someone sharing a file. Only an
+/// explicit refund, dispute or chargeback closes the door.
 ///
-/// There is deliberately NO periodic re-verify here. We store sha256(key), never the key,
-/// so the Worker physically cannot re-ask Gumroad on its own; pretending to (by stamping
-/// `checked_at` forward) would be a check that checks nothing. Re-verification is the
-/// app's job, which does hold the key: it re-activates when its token is older than
-/// LICENSE_RECHECK_SECONDS, and activation is a real Gumroad call that flips `status` to
-/// revoked for a refunded purchase. A pirate who never re-activates keeps a working
-/// token, which is the same posture the app's own licence gate already takes (spec §14:
-/// keep honest people honest, do not build DRM). The quotas bound the damage.
+/// No periodic re-verify: we store sha256(key), never the key, so the Worker can't re-ask
+/// Gumroad, and stamping `checked_at` forward would check nothing. The app holds the key and
+/// re-activates when its token is older than LICENSE_RECHECK_SECONDS; that real Gumroad call
+/// flips `status` to revoked after a refund. A pirate who never re-activates keeps a working
+/// token, the app's own posture (spec §14: keep honest people honest, no DRM). Quotas bound
+/// the damage.
 ///
-/// Called by EVERY route that reads or writes a licence's files: createFile, uploadContent,
-/// listFiles and deleteFile. It used to guard createFile alone, which made a block partial in
-/// a way that read as total: the blocked Mac's still valid token kept enumerating every file
-/// through GET /v1/files and deleting rows through DELETE /v1/files/<id>. That matters more
-/// now that 'blocked' is the ONLY revocation lever the App Store channel has.
+/// Every route that reads or writes a licence's files calls it: createFile, uploadContent,
+/// listFiles and deleteFile. Guarding only createFile would leave a blocked Mac listing and
+/// deleting files with its still-valid token, and 'blocked' is the only revocation lever the
+/// App Store channel has.
 ///
-/// `releaseDevice` is deliberately NOT guarded. Releasing your own Mac is cleanup, not access,
-/// and a blocked user who wants to unregister a machine should be able to.
+/// `releaseDevice` isn't guarded: releasing your own Mac is cleanup, not access, and a blocked
+/// user should still be able to unregister a machine.
 function requireLicense(auth) {
-  // 'blocked' is our own abuse decision, 'revoked' is Gumroad's. Both close the door, and
-  // an unknown or stale status still works, which is the fail-open posture of §14.
+  // 'blocked' is our abuse decision, 'revoked' is Gumroad's. Both close the door; an unknown
+  // or stale status still works (the fail-open posture of §14).
   const status = auth.license.status;
   return status === "revoked" || status === "blocked" ? fail(403, "revoked") : null;
 }
@@ -917,10 +826,9 @@ async function createFile(request, env, auth) {
   if (!Number.isInteger(size) || size <= 0) return fail(400, "bad_request");
   if (size > MAX_FILE_BYTES) return fail(413, "too_big", { max_file_bytes: MAX_FILE_BYTES });
 
-  // Any type is allowed, but the string itself still has to be a type. The allowlist was
-  // the only thing validating this field, and it is not decoration: content_type is
-  // interpolated into the plain-text abuse-report email, where an interior newline (which
-  // .trim() does not touch) would forge lines in it. Shape and length, per RFC 6838.
+  // Any type is allowed, but it must be shaped like one (RFC 6838): content_type goes into the
+  // plain-text abuse-report email, where an interior newline (untouched by .trim()) would forge
+  // lines.
   const contentType = String(body.content_type ?? "").toLowerCase().split(";")[0].trim();
   if (!TYPE_RE.test(contentType)) return fail(400, "bad_type");
 
@@ -960,8 +868,7 @@ async function uploadContent(request, env, auth, id) {
   const blocked = requireLicense(auth);
   if (blocked) return blocked;
 
-  // Scoped by licence, and a miss is 404 rather than 403: answering 403 would confirm
-  // that somebody else's id exists.
+  // Scoped by licence; a miss is 404, since 403 would confirm someone else's id exists.
   const row = await env.DB.prepare(
     "SELECT id, token, name, size, content_type, state, expires_at FROM files WHERE id = ? AND license_hash = ?"
   ).bind(id, auth.license.license_hash).first();
@@ -969,8 +876,8 @@ async function uploadContent(request, env, auth, id) {
   if (row.state !== "pending") return fail(409, "already_uploaded");
   if (row.expires_at <= now()) return fail(410, "gone");
 
-  // Required so the body is a fixed-length stream R2 can consume without buffering.
-  // Workers cap memory at 128 MB; a chunked 50 MiB upload would be read into it.
+  // Required so the body is a fixed-length stream R2 takes without buffering. Workers cap
+  // memory at 128 MB, and a chunked upload would be read into it.
   const declared = request.headers.get("content-length");
   if (declared === null) return fail(411, "length_required");
   const length = Number(declared);
@@ -982,12 +889,11 @@ async function uploadContent(request, env, auth, id) {
   const key = `f/${id}`;
   let object;
   try {
-    // request.body goes straight through, unwrapped: R2 only accepts a fixed-length
-    // stream, and wrapping it in any way loses that.
+    // request.body goes through unwrapped: R2 only accepts a fixed-length stream, and any
+    // wrapping loses that.
     object = await env.FILES.put(key, request.body, {
       httpMetadata: {
-        // Recorded for our own bookkeeping only. The download path always serves
-        // octet-stream, whatever this says.
+        // Bookkeeping only; downloads are always served as octet-stream.
         contentType: "application/octet-stream",
         contentDisposition: attachmentHeader(row.name ?? "file"),
       },
@@ -1000,14 +906,12 @@ async function uploadContent(request, env, auth, id) {
     return fail(500, "upload_failed");
   }
 
-  // The declared type was checked at create time; this is where the actual bytes are
-  // checked. A renamed .exe claiming to be a PNG dies here, before its link works.
+  // The declared type was checked at create time; here the actual bytes are. A renamed .exe
+  // claiming to be a PNG dies before its link works.
   //
-  // Except when the client sealed the file, which since 1.38.0 it always does: those bytes
-  // are ciphertext and match no signature, so the check would refuse every upload. This is
-  // not a hole somebody opens with a header, it is the honest consequence of the server no
-  // longer being able to see the file at all. A client that wanted to dodge the sniff could
-  // always simply declare application/octet-stream, which has no signature either.
+  // Except for sealed files, which current clients always send: ciphertext matches no
+  // signature. That's not a hole a header opens, just the server no longer seeing the file;
+  // a client could dodge the sniff anyway by declaring application/octet-stream.
   const sealed = request.headers.get("x-mushroom-encrypted") === "1";
   if (!sealed && !(await storedBytesMatchType(env, key, row.content_type))) {
     await env.FILES.delete(key).catch(() => {});
@@ -1023,26 +927,23 @@ async function uploadContent(request, env, auth, id) {
 
 /// The page a browser gets for a live link, and the other half of `SporeCrypto` in the Kit.
 ///
-/// Since 1.38.0 the Mac seals every file before it leaves, with a key that travels in the
-/// link's fragment. A fragment is never put in a request by any browser, so the key cannot
-/// reach this Worker even in a log; this page is what turns it back into a file. The format
-/// is `"MSH1" || nonce(12) || AES-GCM-256 ciphertext+tag`, and the fixed vector both sides
-/// assert against lives in `vector.mjs` and `SporeCryptoTests.swift`. Changing one is
-/// changing all three.
+/// The Mac seals every file with a key carried in the link's fragment. Browsers never send a
+/// fragment, so the key can't reach this Worker, even in a log; this page turns it back into a
+/// file. Format: `"MSH1" || nonce(12) || AES-GCM-256 ciphertext+tag`. The fixed test vector
+/// lives in `vector.mjs` and `SporeCryptoTests.swift`; change one, change all three.
 ///
-/// **Nothing is interpolated into this string.** The page reads the token out of its own
-/// location, so there is no path by which anything a stranger controls reaches the markup.
-/// That is what makes the inline script safe to allow in the CSP; keep it that way, and if
-/// you ever need a server value in here, put it in a `data-` attribute and escape it.
+/// **Nothing is interpolated into this string.** The page reads the token from its own
+/// location, so nothing a stranger controls reaches the markup. That's what makes the inline
+/// script safe in the CSP; if you ever need a server value here, put it in an escaped `data-`
+/// attribute.
 ///
-/// It is served from this origin, which is also where the file bytes come from, so there is
-/// no CORS to arrange and a self-hosted deployment gets this for free. The bytes themselves
-/// are still octet-stream + attachment + nosniff + `default-src 'none'; sandbox`, so nothing
-/// shared can execute here whatever this page does.
+/// Served from the same origin as the file bytes, so no CORS, and self-hosters get it free.
+/// The bytes are still octet-stream + attachment + nosniff + `default-src 'none'; sandbox`,
+/// so nothing shared can execute here whatever this page does.
 ///
-/// The palette is a deliberate third copy of `Mushroom_www/tokens.css` (the second being
-/// `ds/src/styles.css`), because a Worker response cannot link a stylesheet on another
-/// origin. If the tokens change, port them.
+/// The palette is a third copy of `Mushroom_www/tokens.css` (the second is
+/// `ds/src/styles.css`), since a Worker response can't link a stylesheet on another origin. If
+/// the tokens change, port them.
 const RECEIVE_PAGE = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1102,8 +1003,8 @@ const RECEIVE_PAGE = `<!doctype html>
   // The key, and the reason this page exists. Read from the fragment and never put into a
   // request, a header or a URL: that is the whole guarantee.
   //
-  // Guarded, because a stray % in a mangled link makes decodeURIComponent THROW, and thrown
-  // out here it took the whole script with it: no name, no button, and the page sat on
+  // Guarded, because a stray % in a mangled link makes decodeURIComponent throw, and thrown
+  // out here it takes the whole script with it: no name, no button, and the page sits on
   // "Looking for this file…" forever with nothing to explain it. A key we cannot decode is a
   // key we do not have, which the "missing its key" message below already says properly.
   var key = "";
@@ -1217,9 +1118,8 @@ const RECEIVE_PAGE = `<!doctype html>
 
 function gonePage(message, env) {
   const brand = brandURL(env);
-  // No link at all when this deployment names nobody. `brand` is operator configuration,
-  // never anything a visitor can influence, so it is not escaped; `message` is one of the
-  // two fixed strings below.
+  // No link when this deployment names nobody. `brand` is operator config, never visitor
+  // input, so it isn't escaped; `message` is one of the two fixed strings below.
   const footer = brand
     ? `<p><a href="${brand}">${brand.replace(/^https?:\/\//, "")}</a></p>`
     : "";
@@ -1240,15 +1140,14 @@ async function download(request, env, ctx, token) {
   if (!row) return new Response("Not found", { status: 404, headers: { "cache-control": "no-store" } });
   if (row.state === "deleted") return removedPage(env);
   if (row.state === "expired" || row.expires_at <= now()) return expiredPage(env);
-  // Never finished uploading: indistinguishable from a bad link, and should be.
+  // Never finished uploading: deliberately indistinguishable from a bad link.
   if (row.state !== "ready") {
     return new Response("Not found", { status: 404, headers: { "cache-control": "no-store" } });
   }
 
-  // A browser NAVIGATING here gets the page that can decrypt; everything else (the page's
-  // own fetch, curl, wget, a download manager) sends */* and gets the bytes. One URL, so a
-  // link that has been in circulation for hours keeps working exactly as it did, and the
-  // range support below is untouched.
+  // A browser navigating here gets the page that can decrypt; everything else (the page's own
+  // fetch, curl, wget, a download manager) sends */* and gets the bytes. One URL serves both,
+  // and range support below is untouched.
   if (request.method === "GET" && (request.headers.get("accept") ?? "").includes("text/html")) {
     return new Response(RECEIVE_PAGE, {
       headers: {
@@ -1256,9 +1155,8 @@ async function download(request, env, ctx, token) {
         "cache-control": "no-store",
         "referrer-policy": "no-referrer",
         "x-content-type-options": "nosniff",
-        // 'unsafe-inline' is safe HERE and only here: RECEIVE_PAGE is a constant with no
-        // interpolation, so there is nothing for anyone to inject into. connect-src 'self'
-        // is what stops any of it, key included, being sent anywhere else.
+        // 'unsafe-inline' is safe here and only here: RECEIVE_PAGE is a constant with no
+        // interpolation. connect-src 'self' keeps anything, key included, from going elsewhere.
         "content-security-policy":
           "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
           "connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
@@ -1271,8 +1169,7 @@ async function download(request, env, ctx, token) {
   try {
     object = await env.FILES.get(`f/${row.id}`, range ? { range: request.headers } : undefined);
   } catch {
-    // R2 throws on an unsatisfiable range rather than returning null. Answer the way the
-    // spec says to instead of turning a bad header into a 500.
+    // R2 throws on an unsatisfiable range. Answer 416 as the spec says, not a 500.
     return new Response("Range not satisfiable", {
       status: 416,
       headers: { "content-range": `bytes */${row.size}`, "cache-control": "no-store" },
@@ -1281,8 +1178,8 @@ async function download(request, env, ctx, token) {
   if (!object) return expiredPage(env);   // lifecycle rule got there first
 
   const headers = new Headers();
-  // ALWAYS octet-stream, never the declared type. Serving attacker-chosen HTML or SVG
-  // from a subdomain of getmushroom.app would be stored XSS against the marketing site.
+  // Always octet-stream, never the declared type: attacker-chosen HTML or SVG on a
+  // getmushroom.app subdomain would be stored XSS against the marketing site.
   headers.set("content-type", "application/octet-stream");
   headers.set("content-disposition", attachmentHeader(row.name ?? "file"));
   headers.set("x-content-type-options", "nosniff");
@@ -1291,8 +1188,8 @@ async function download(request, env, ctx, token) {
   headers.set("referrer-policy", "no-referrer");
   headers.set("accept-ranges", "bytes");
 
-  // Gated on the REQUEST carrying a Range, not just on object.range existing: R2 fills
-  // that in for a plain get too, which turned every ordinary download into a 206.
+  // Gated on the request carrying a Range, not just object.range: R2 fills that in for a
+  // plain get too, which would turn every download into a 206.
   if (range && object.range && "offset" in object.range) {
     const start = object.range.offset ?? 0;
     const end = start + (object.range.length ?? object.size) - 1;
@@ -1306,8 +1203,7 @@ async function download(request, env, ctx, token) {
 }
 
 const removedPage = (env) => gonePage("This file was removed.", env);
-// The lifetime is read from TTL_SECONDS rather than written out, so a self-hoster who
-// shortens it does not end up with a page confidently quoting our number.
+// Read from TTL_SECONDS, so a self-hoster who shortens it doesn't get a page quoting ours.
 const expiredPage = (env) =>
   gonePage(`This link has expired. Mushroom links last ${Math.round(TTL_SECONDS / 3600)} hours.`, env);
 
@@ -1343,8 +1239,7 @@ async function deleteFile(env, auth, id) {
   if (!row) return fail(404, "not_found");
   if (row.state === "deleted") return reply(200, {});   // idempotent
 
-  // R2 first. A row claiming "deleted" while the bytes are still fetchable is the bad
-  // direction to fail in.
+  // R2 first: a row saying "deleted" while the bytes are still fetchable is the bad way to fail.
   await env.FILES.delete(`f/${id}`);
   await env.DB.prepare("UPDATE files SET state = 'deleted', deleted_at = ?, name = NULL WHERE id = ?")
     .bind(now(), id).run();
@@ -1403,11 +1298,10 @@ async function turnstileOK(token, ip, env) {
   }
   if (!outcome?.success) return false;
 
-  // Cloudflare's documented testing secrets answer for a fixed dummy hostname
-  // ("example.com") and no action, and it flags them itself. Skipping the two checks in
-  // that one case is what lets the local suite exercise the whole path; it cannot soften
-  // production, because a real secret never produces this flag, and a testing secret
-  // accepts literally any token anyway so these checks would be the least of it.
+  // Cloudflare's testing secrets answer with a dummy hostname ("example.com") and no action,
+  // and flag themselves. Skipping the checks then lets the local suite run the whole path. It
+  // can't soften production: a real secret never sets this flag, and a testing secret accepts
+  // any token anyway.
   if (outcome.metadata?.result_with_testing_key === true) return true;
 
   if (outcome.hostname && !reportOrigins(env).includes(`https://${outcome.hostname}`)) return false;
@@ -1449,9 +1343,8 @@ async function abuseReport(request, env, ctx) {
     return reportReply(400, { code: "bad_contact", message: "Please give a name and an email we can reply to." }, origin, env);
   }
 
-  // Everything from here answers identically whether or not the link resolves. A
-  // different status, body, or timing-visible branch would make this an oracle for
-  // guessing share tokens.
+  // From here the answer is identical whether or not the link resolves; any difference in
+  // status, body or visible timing would make this an oracle for guessing share tokens.
   const accepted = reportReply(200, { message: REPORT_ACCEPTED }, origin, env);
 
   const file = await env.DB.prepare(
@@ -1466,7 +1359,7 @@ async function abuseReport(request, env, ctx) {
     "FROM abuse_reports WHERE file_id = ? AND created_at > ?"
   ).bind(reason, file.id, stamp - REPORT_DEDUPE_SECONDS).first();
 
-  // A second report of the same thing, or a pile-on, is not new information.
+  // A repeat report or a pile-on is not new information.
   if ((recent?.same ?? 0) > 0) return accepted;
   if ((recent?.total ?? 0) >= MAX_REPORTS_PER_FILE_PER_DAY) return accepted;
 
@@ -1485,8 +1378,8 @@ async function abuseReport(request, env, ctx) {
   return accepted;
 }
 
-/// The two commands that act on a report. Deliberately POST and bearer-authenticated, so
-/// a mail client or link scanner following anything in this email cannot take an action.
+/// The two commands that act on a report. POST and bearer-authenticated, so a mail client or
+/// link scanner following anything in the email can't take an action.
 function adminCommands(env, file) {
   const base = env.PUBLIC_BASE;
   return [
@@ -1504,8 +1397,8 @@ function adminCommands(env, file) {
   ].join("\n");
 }
 
-/// Best effort. The row is written either way and the cron retries a failure, which is
-/// the same ordering the tools form uses: durable first, notify second.
+/// Best effort. The row is written either way and the cron retries failures: durable first,
+/// notify second, like the tools form.
 async function notifyOwner(env, r) {
   const when = new Date(r.stamp * 1000).toISOString();
   const expires = new Date(r.file.expires_at * 1000).toISOString();
@@ -1542,8 +1435,8 @@ async function notifyOwner(env, r) {
     await env.EMAIL.send({
       to: ABUSE_TO,
       from: { email: ABUSE_FROM, name: "Mushroom reports" },
-      // The reason is a fixed enum and the id is a uuid, so neither can carry a newline
-      // into the header. The filename never appears here, for exactly that reason.
+      // Reason is a fixed enum and the id a uuid, so neither can put a newline in the header.
+      // That's why the filename never appears here.
       subject: `[Mushroom report] ${r.reason}, file ${shortFile}`,
       text,
       html: `<pre style="font:13px/1.5 ui-monospace,monospace;white-space:pre-wrap">${escapeHTML(text)}</pre>`,
@@ -1557,20 +1450,21 @@ async function notifyOwner(env, r) {
 
 // ---------------------------------------------------------------- owner actions
 
-/// Constant-time-ish bearer check. The token is a shared secret, not a per-user one, so
-/// there is nothing to enumerate; the length guard just avoids leaking it via timing.
+/// Constant-time-ish bearer check. The token is one shared secret, so there's nothing to
+/// enumerate; the loop avoids leaking it via timing.
 function adminOK(request, env) {
   const header = request.headers.get("authorization") ?? "";
   const given = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
   const want = env.ADMIN_TOKEN ?? "";
-  if (!want || given.length !== want.length) return false;
+  // The placeholder config.capnp.example ships with is public, so it's no secret at all.
+  if (!want || want === "CHANGE-ME" || given.length !== want.length) return false;
   let diff = 0;
   for (let i = 0; i < want.length; i++) diff |= given.charCodeAt(i) ^ want.charCodeAt(i);
   return diff === 0;
 }
 
-/// Delete the R2 object first, then the row. A row that says deleted while the bytes are
-/// still fetchable is the bad direction to fail in.
+/// R2 object first, then the row: a row saying deleted while the bytes are still fetchable is
+/// the bad way to fail.
 async function purgeFile(env, id) {
   await env.FILES.delete(`f/${id}`).catch(() => {});
   await env.DB.prepare(
@@ -1591,9 +1485,8 @@ async function adminDeleteFile(request, env) {
   return reply(200, { file_id: id });
 }
 
-/// Blocks FILE SHARING for this licence, and nothing else. The customer's app keeps
-/// working: disabling the actual purchase is a separate, deliberate act in Gumroad using
-/// the sale id in the report email.
+/// Blocks file sharing for this licence, nothing else; the app keeps working. Disabling the
+/// purchase is a separate act in Gumroad, using the sale id in the report email.
 async function adminBlockLicense(request, env) {
   let body;
   try { body = await request.json(); } catch { return fail(400, "bad_request"); }
@@ -1603,10 +1496,10 @@ async function adminBlockLicense(request, env) {
   const row = await env.DB.prepare("SELECT license_hash FROM licenses WHERE license_hash = ?").bind(hash).first();
   if (!row) return fail(404, "not_found");
 
-  // 'blocked', not 'revoked': a Gumroad revocation can legitimately clear (a reversed
-  // refund re-verifies as active on the next activate), and the upsert in activateDevice
-  // lets it. An admin block must survive that, and for an App Store hash it is the ONLY
-  // lever, because this Worker never re-asks Apple. Same split mushroom-messaging uses.
+  // 'blocked', not 'revoked': a Gumroad revocation can legitimately clear (a reversed refund
+  // re-verifies as active), and the activateDevice upsert allows that. A block must survive
+  // it, and for an App Store hash it's the only lever, since this Worker never re-asks Apple.
+  // Same split as mushroom-messaging.
   await env.DB.prepare("UPDATE licenses SET status = 'blocked' WHERE license_hash = ?").bind(hash).run();
   await env.DB.prepare("UPDATE devices SET revoked_at = ? WHERE license_hash = ? AND revoked_at IS NULL")
     .bind(now(), hash).run();
@@ -1634,8 +1527,7 @@ async function sweep(env) {
   if (ids.length) {
     await env.FILES.delete(ids.map((id) => `f/${id}`));
     const holes = ids.map(() => "?").join(",");
-    // NULL the name at the same time: the tombstone only has to answer "expired", it
-    // does not need to remember what was shared.
+    // NULL the name too: the tombstone only answers "expired", not what was shared.
     await env.DB.prepare(
       `UPDATE files SET state = 'expired', name = NULL WHERE id IN (${holes})`
     ).bind(...ids).run();
@@ -1645,15 +1537,14 @@ async function sweep(env) {
     "DELETE FROM files WHERE state IN ('expired','deleted') AND expires_at <= ?"
   ).bind(stamp - TOMBSTONE_SECONDS).run();
 
-  // Spent throttle windows. Nothing reads them once they expire, and without this the table
-  // grows by one row per distinct IP per window forever.
+  // Spent throttle windows; otherwise the table grows a row per IP per window forever.
   await env.DB.prepare("DELETE FROM throttle WHERE expires_at <= ?").bind(stamp).run();
 
   await env.DB.prepare(
     "DELETE FROM devices WHERE revoked_at IS NOT NULL AND revoked_at <= ?"
   ).bind(stamp - TOMBSTONE_SECONDS).run();
 
-  // Reports whose email never went out. The row was always durable; this is the retry.
+  // Retry reports whose email never went out.
   const unsent = await env.DB.prepare(
     "SELECT id, file_id, reason, details, reporter_name, reporter_email, created_at " +
     "FROM abuse_reports WHERE notified = 'failed' ORDER BY created_at LIMIT ?"
@@ -1678,8 +1569,8 @@ async function sweep(env) {
     }
   }
 
-  // The reporter volunteered a name and an email so we could follow up. Thirty days is
-  // long enough to have done that, and holding it longer serves nobody.
+  // The reporter's name and email are for follow-up; thirty days is enough, longer serves
+  // nobody.
   await env.DB.prepare(
     "UPDATE abuse_reports SET reporter_name = NULL, reporter_email = NULL " +
     "WHERE created_at <= ? AND reporter_email IS NOT NULL"
@@ -1702,13 +1593,13 @@ export default {
 
     if (path === "/" ) {
       const brand = brandURL(env);
-      // A deployment that names nobody says nothing. Sending a self-hoster's visitors to
-      // our marketing site is not this Worker's business.
+      // A deployment that names nobody says nothing; a self-hoster's visitors aren't ours to
+      // send to our marketing site.
       if (!brand) return new Response("Not found", { status: 404, headers: { "cache-control": "no-store" } });
       return Response.redirect(brand, 302);
     }
 
-    // Public download. No auth, that is the whole feature.
+    // Public download. No auth; that's the feature.
     if (path.startsWith("/f/") && (method === "GET" || method === "HEAD")) {
       const token = path.slice(3);
       if (!token || token.includes("/")) {
@@ -1718,28 +1609,27 @@ export default {
     }
 
     if (path === "/v1/devices/activate" && method === "POST") {
-      // BEFORE activateDevice, because activateDevice is what a flood is spending: the
-      // App Store branch walks an attacker-supplied certificate chain twice per call
-      // (PRODUCTION then SANDBOX) on a route with no bearer token in front of it.
-      // Same posture as mushroom-messaging, which throttles this endpoint via its DO.
-      const ip = request.headers.get("cf-connecting-ip") ?? "unknown";
-      if (!(await throttle(env, "activate", ip, ACTIVATIONS_PER_MINUTE_PER_IP, 60))) {
+      // Before activateDevice, which is what a flood spends: the App Store branch walks an
+      // attacker-supplied certificate chain twice per call (Production, then Sandbox) with no
+      // bearer token in front. mushroom-messaging throttles this endpoint via its DO.
+      //
+      // Self-hosted, nothing sets or strips cf-connecting-ip, so a client could pick a fresh
+      // bucket per request. One bucket for the box instead.
+      const ip = env.SELFHOST === "1" ? "box" : (request.headers.get("cf-connecting-ip") ?? "unknown");
+      if (!(await throttle(env, "activate", ip, activationsPerMinutePerIP(env), 60))) {
         return fail(429, "rate_limited", { retry_after: 60 });
       }
       return activateDevice(request, env);
     }
 
-    // PUBLIC, and it lives under /v1/, so it has to be matched ABOVE the device-token
-    // gate below or the report form gets a 401 from a browser that has no token and
-    // never will. No OPTIONS handler: the form posts FormData, which is a simple
-    // request, so there is no preflight to answer.
+    // Public but under /v1/, so it's matched above the device-token gate, or the report form
+    // gets a 401. No OPTIONS handler: FormData is a simple request, so there's no preflight.
     if (path === "/v1/abuse-reports" && method === "POST") {
       return abuseReport(request, env, ctx);
     }
 
-    // Owner-only. POST only, so a mail client or link scanner that follows something in
-    // a report email can never take an action. Not under /v1/, so it misses the device
-    // gate cleanly.
+    // Owner-only. POST only, so a mail client or link scanner following a report email can't
+    // take an action. Outside /v1/, so it skips the device gate.
     if (path.startsWith("/admin/")) {
       if (method !== "POST") return fail(405, "post_only");
       if (!adminOK(request, env)) return fail(401, "unauthorized");
@@ -1750,9 +1640,8 @@ export default {
 
     // Everything below needs a device token.
     if (path.startsWith("/v1/")) {
-      // Release is cleanup, not access, so it authenticates WITHOUT the entitlement clause:
-      // see the note on `authenticate`. Matched before the general gate because that gate is
-      // exactly what used to 401 it.
+      // Release is cleanup, not access, so it skips the entitlement clause (see
+      // `authenticate`). Matched first, since the general gate would 401 it.
       const releasing = path === "/v1/devices/release" && method === "POST";
       const auth = await authenticate(request, env, ctx, { allowExpired: releasing });
       if (!auth) return refusal(request, env, ctx);

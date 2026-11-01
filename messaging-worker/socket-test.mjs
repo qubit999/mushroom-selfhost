@@ -1,7 +1,7 @@
 // The half of the suite curl cannot reach: everything that happens over the WebSocket.
 //
-// Driven by test.sh, which seeds the licenses and devices this expects and passes the two
-// tokens in. Node's global WebSocket (v22+) is enough; there is no dependency to install.
+// Driven by test.sh, which seeds the licenses and devices and passes the two tokens in. Node's
+// global WebSocket (v22+) is enough; nothing to install.
 //
 // Same rule as the rest of the repo: never print a token or a ciphertext.
 
@@ -19,19 +19,18 @@ const want = (label, expected, actual) =>
     ? ok(label)
     : bad(label, `expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
 
-/// A socket plus a queue, so a test can await the next frame of a given type without
-/// racing whatever else the server decided to send first (a presence snapshot, usually).
+/// A socket plus a queue, so a test can await the next frame of a type without racing whatever
+/// the server sent first (usually a presence snapshot).
 function connect(token, { presence = true } = {}) {
   const url = `${BASE.replace(/^http/, "ws")}/v1/connect?token=${token}` +
               (presence ? "" : "&presence=0");
   const socket = new WebSocket(url);
-  // Pending frames are CONSUMED by next(), so a second `next("accepted")` waits for a
-  // genuinely new one instead of handing back the first one again. Getting this wrong makes
-  // every later assertion pass against a stale frame, which is worse than failing.
+  // next() consumes pending frames, so a second `next("accepted")` waits for a new one rather
+  // than returning the first again; otherwise later assertions pass against stale frames.
   const pending = [];
   const waiters = [];
-  // Monotonic per type, never consumed, so none() can ask "did any MORE arrive" without
-  // caring what next() has taken off the queue.
+  // Monotonic per type, never consumed, so none() can ask "did any more arrive" regardless of
+  // what next() took.
   const arrivals = new Map();
 
   socket.addEventListener("message", (event) => {
@@ -64,8 +63,7 @@ function connect(token, { presence = true } = {}) {
         reject(new Error(`timed out waiting for "${type}"`));
       }, ms);
     }),
-    /// Asserts that no FURTHER frame of this type arrives, which is the shape most of the
-    /// privacy assertions take.
+    /// Asserts that no further frame of this type arrives, the shape of most privacy assertions.
     none: async (type, ms = 800) => {
       const before = arrivals.get(type) ?? 0;
       await new Promise((r) => setTimeout(r, ms));
@@ -89,11 +87,10 @@ async function main() {
 
   // ---------------------------------------------------------------- befriend
   //
-  // Alice's socket is opened BEFORE her code is used, because the frame that tells her who
-  // used it is the point. Accepting an invite returns the inviter's details to the ACCEPTER
-  // and for a long time told the person who CREATED the code nothing at all: their app had
-  // no row and no public key for the new friend, so it dropped every message they sent and
-  // had nothing to reply with. Messaging worked only in the direction the code travelled.
+  // Alice's socket opens before her code is used, because the frame telling her who used it is
+  // the point. Accepting returns the inviter's details to the accepter; without this frame the
+  // code's creator has no row or public key for the new friend, drops their messages and can't
+  // reply, so messaging would work only in the direction the code travelled.
   const inviter = connect(aliceToken);
   await inviter.open();
 
@@ -106,8 +103,8 @@ async function main() {
   try {
     const added = await inviter.next("friend_added");
     want("the inviter is told who accepted", await bobIdentity(), added.peer_id);
-    // The key as well as the id: without it there is nothing to derive a shared key from,
-    // so the friendship would be visible and still unusable.
+    // The key as well as the id: without it there's no shared key, so the friendship would be
+    // visible but unusable.
     want("and gets the key to reply with", true,
          typeof added.public_key === "string" && added.public_key.length > 0);
   } catch (error) {
@@ -115,8 +112,8 @@ async function main() {
   }
   inviter.close();
 
-  // The offline half of the same problem: a Mac asleep when its code was used has no socket
-  // to hear that frame on, and this is the only other way it can ever find out.
+  // The offline half: a Mac asleep when its code was used has no socket to hear that frame, and
+  // this is its only other way to find out.
   for (const [who, token] of [["inviter", aliceToken], ["accepter", bobToken]]) {
     const list = await (await fetch(`${BASE}/v1/friends`, {
       headers: { authorization: `Bearer ${token}` },
@@ -124,8 +121,8 @@ async function main() {
     want(`the ${who} can list the friendship`, 1, list.friends?.length);
   }
 
-  // `let`, because the blocking section below has to take Alice offline and bring her back
-  // to make the presence announcement fire at all.
+  // `let`, because the blocking section takes Alice offline and back to make the presence
+  // announcement fire.
   let a = connect(aliceToken);
   const b = connect(bobToken);
   await Promise.all([a.open(), b.open()]);
@@ -140,8 +137,8 @@ async function main() {
   const arrived = await b.next("message");
   want("recipient gets the message", "m1", arrived.message.msg_id);
   want("routed from alice", alice, arrived.message.peer_id);
-  // The server stores and forwards the blob unchanged. If this ever fails, something in
-  // the path is re-encoding what it should not be able to read.
+  // The server stores and forwards the blob unchanged. If this fails, something is re-encoding
+  // what it shouldn't be able to read.
   want("ciphertext survives untouched", sealed("hello"), arrived.message.ciphertext);
 
   // ---------------------------------------------------------------- dedup
@@ -167,13 +164,12 @@ async function main() {
 
   // ---------------------------------------------------------------- our own Macs
   //
-  // One identity, several Macs. The app copies what it sends to its own inbox, because
-  // `deliver` files a message in the RECIPIENT's inbox and our outbox therefore becomes a
-  // stored row nowhere: without this a second Mac shows every message a friend sent and none
-  // of the replies. Same for what the user calls people and what they have read.
+  // One identity, several Macs. `deliver` files a message in the recipient's inbox, so our
+  // outbox is stored nowhere; the app copies what it sends to its own inbox, or a second Mac
+  // shows a friend's messages and none of the replies. Same for names and read state.
   //
-  // Alice's second socket stands in for that second Mac. It is opened first, so a frame that
-  // arrives before it is listening cannot make this pass by accident.
+  // Alice's second socket stands in for that Mac. It opens first, so a frame arriving before
+  // it listens can't make this pass by accident.
   const aliceMac2 = connect(aliceToken);
   await aliceMac2.open();
 
@@ -186,7 +182,7 @@ async function main() {
     bad("a message to our own identity is accepted", error.message);
   }
 
-  // THE assertion. Everything else here is satisfied by a send that goes nowhere.
+  // The key assertion; everything else here passes even if the send goes nowhere.
   try {
     const onMac2 = await aliceMac2.next("message");
     want("it reaches the user's other Mac", "self1", onMac2.message.msg_id);
@@ -197,8 +193,8 @@ async function main() {
     bad("it reaches the user's other Mac", error.message);
   }
 
-  // And nobody else's. `send()` fans out to every socket on ONE inbox, but a bug that filed it
-  // in the friend's inbox instead would look identical from Alice's side.
+  // And nobody else's. `send()` fans out to every socket on one inbox, but filing it in the
+  // friend's inbox by mistake would look identical from Alice's side.
   want("and never reaches the friend", true, await b.none("message"));
 
   const selfSync = await (await fetch(`${BASE}/v1/sync?after=0`, {
@@ -237,18 +233,16 @@ async function main() {
   a.send({ t: "send", msg_id: "m2", peer_id: await bobIdentity(), ciphertext: sealed("nope"),
            sent_at: Math.floor(Date.now() / 1000) });
   const rejected = await a.next("rejected");
-  // Never "blocked": telling someone they have been blocked is the blocker's to give.
+  // Never "blocked": revealing a block is the blocker's call.
   want("a blocked send is refused as not_friends", "not_friends", rejected.code);
   want("blocked message never arrives", true, await b.none("message"));
 
   a.send({ t: "typing", peer_id: await bobIdentity() });
   want("blocked typing never arrives", true, await b.none("typing"));
 
-  // Presence too, which is the one inbound handler that had no such guard. `announcePresence`
-  // only ever fans out to `blocked = 0`, so blocking stopped US telling THEM; nothing stopped
-  // them telling us, and the `reply_to` bounce then sent our own state straight back to the
-  // person who had been blocked. Alice has to go fully offline and return, because a second
-  // socket on an already-online inbox announces nothing.
+  // Presence too. `announcePresence` skips blocked peers, but without the inbound guard they
+  // could still tell us, and the `reply_to` bounce would send our state back to them. Alice
+  // goes fully offline and back, since a second socket on an online inbox announces nothing.
   a.close();
   await new Promise((resolve) => setTimeout(resolve, 300));
   a = connect(aliceToken);
@@ -280,14 +274,12 @@ async function main() {
 
   // ---------------------------------------------------------------- revocation
   //
-  // A socket is authenticated once, at the upgrade, and hibernation means it can outlive the
-  // process that checked it. Releasing the device has to CLOSE it: without that, an evicted
-  // seat, a "Start Over", or a license blocked for abuse left the old connection sending,
-  // acking and receiving for as long as it happened to stay up, because nothing re-checks
-  // and the client only reconnects on error.
+  // A socket is authenticated once, at the upgrade, and hibernation lets it outlive that.
+  // Releasing the device must close it, or an evicted seat, "Start Over" or a blocked license
+  // leaves the old connection working while it stays up; the client only reconnects on error.
   //
-  // BOB's token, not alice's, and last: releasing spends the token, and test.sh's rate-limit
-  // section runs after this one against alice.
+  // Bob's token, not Alice's, and last: releasing spends the token, and test.sh's rate-limit
+  // section runs after this against Alice.
   const closed = new Promise((resolve) => {
     b.socket.addEventListener("close", () => resolve(true), { once: true });
     setTimeout(() => resolve(false), 3000);
@@ -299,7 +291,7 @@ async function main() {
   b.close();
 
   async function bobIdentity() {
-    // Derived the same way the Worker does it, from the key test.sh seeded.
+    // Derived as the Worker does, from the key test.sh seeded.
     return process.env.BOB_IDENTITY;
   }
 }

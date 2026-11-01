@@ -1,8 +1,8 @@
 [Unit]
 Description=Mushroom blob store
 Documentation=file:/opt/mushroom/README.md
-# workerd connects to this socket lazily, on the first upload or download, so strict ordering is
-# not required for correctness. It is here so a boot does not log a confusing first failure.
+# workerd connects lazily, on the first upload or download, so ordering isn't needed for
+# correctness; it just keeps a boot from logging a confusing first failure.
 Before=mushroom-workerd.service
 
 [Service]
@@ -17,14 +17,17 @@ Environment=BLOB_ROOT=/var/lib/mushroom/blobs
 Environment=BLOB_SOCKET=/run/mushroom/blobd.sock
 
 # /run/mushroom is shared with mushroom-workerd.service, which declares it too.
-# RuntimeDirectoryPreserve is what stops one unit's shutdown from deleting the directory the
-# other is still using, taking its sockets with it.
+# RuntimeDirectoryPreserve stops one unit's shutdown deleting the directory (and sockets) the
+# other is still using.
 RuntimeDirectory=mushroom
 RuntimeDirectoryPreserve=yes
-StateDirectory=mushroom
+# Just the blobs. StateDirectory= paths are exempt from ProtectSystem=, so `mushroom` here would
+# hand this process every database read-write, whatever ReadWritePaths says below.
+StateDirectory=mushroom/blobs
+UMask=0077
 
 # This process turns strings off a socket into filesystem paths, so it gets the narrowest
-# filesystem it can still do its job with.
+# filesystem that still works.
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
@@ -34,7 +37,10 @@ ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 ReadWritePaths=/var/lib/mushroom/blobs
-# No network of any kind: it listens on a unix socket and speaks to nobody.
+# Read-only isn't enough for these: same user, so it could read every message database and the
+# admin token. `-` because a fresh box may not have created them yet.
+InaccessiblePaths=-/var/lib/mushroom/do-messaging -/var/lib/mushroom/do-files -/opt/mushroom/config.capnp
+# No network at all: it listens on a unix socket and talks to nobody.
 RestrictAddressFamilies=AF_UNIX
 IPAddressDeny=any
 

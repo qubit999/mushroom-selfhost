@@ -56,14 +56,15 @@ docker compose logs workerd
 ```
 
 Four containers, from one image: `workerd` (the two servers), `blobd` (file storage), `cron`
-(expiry sweeps) and `backup`. Data lives in three named volumes.
+(expiry sweeps) and `backup`. Data lives in named volumes; `state` is the one that matters.
 
-`.env` has two values, and only the first is required:
+`.env` has two required values:
 
 - **`PUBLIC_BASE`**. **Get this right.** It goes into every share link the box hands out, so a
   wrong value gives people links pointing somewhere else for files that live on yours. The
   deployment refuses to start without it.
-- **`ENROLLMENT_HASHES`**, which defaults to `*`. See Licences.
+- **`ENROLLMENT_HASHES`**, who may activate. See Licences. The deployment refuses to start without
+  it.
 
 ### Keep a copy of your credentials
 
@@ -93,10 +94,8 @@ an x86 box needs `docker build --platform linux/amd64 .`.
 
 ## Licences
 
-**Nothing to do.** Everyone activates with the licence key they already have.
-
-If you would rather the deployment only accept keys you have named, replace the `*` in
-`ENROLLMENT_HASHES` with a space-separated list of hashes, one per person:
+Everyone activates with the licence key they already have, once you have named them. Set
+`ENROLLMENT_HASHES` to a space-separated list of hashes, one per person:
 
 ```bash
 printf '%s' 'THEIR-LICENCE-KEY' | tr '[:lower:]' '[:upper:]' | sha256sum
@@ -108,8 +107,13 @@ Removing someone is removing their hash and running `docker compose up -d` again
 
 A list means a list. It is checked against whatever credential arrives, not just the licence keys
 it is written in terms of, so nothing activates on your box without being on it. An empty
-`ENROLLMENT_HASHES` is not a way to say `*`: it refuses everything, on the grounds that a box
-nobody finished configuring should not be enrolling anyone.
+`ENROLLMENT_HASHES` refuses everything, on the grounds that a box nobody finished configuring
+should not be enrolling anyone.
+
+`*` accepts any string as a licence key. The box cannot reach Gumroad to check one, so with `*`
+anyone who can reach the deployment can activate, and on file sharing that is anyone holding one
+of your share links. Use it only where nobody untrusted can reach either address, such as a
+tailnet of your own staff with no Funnel.
 
 ## Put https in front
 
@@ -148,10 +152,10 @@ so do it once, at setup.
 
 ## Admin
 
-Each server has an admin socket inside the deployment, and that is the channel to use: it is
-reachable only by something already on the box. The same commands also answer on the http
-listener, so if you installed without Docker, set `ADMIN_TOKEN` to something of your own before
-you put a proxy in front. The container generates one for you.
+Each server has an admin socket inside the deployment, and it is the only way in: it is reachable
+only by something already on the box, and the http listeners answer 404 to every admin path. The
+commands still take `ADMIN_TOKEN`, which the container generates for you; without Docker, set it to
+something of your own, since the placeholder is refused.
 
 Block a licence and revoke its devices:
 
@@ -164,6 +168,9 @@ docker compose exec workerd sh -c '. /var/lib/mushroom/secrets.env; \
 
 Delete a shared file immediately, the same shape, against `/run/mushroom/files-admin.sock` and
 `/admin/files/delete` with `{"file_id":"<id>"}`.
+
+Without Docker the sockets belong to the `mushroom` user and nobody else, so run the same `curl`
+with `sudo -u mushroom`.
 
 ## Backups
 
@@ -208,6 +215,12 @@ one of the Macs, mid conversation, with nothing said about it. This release also
 endpoints the app uses to list those devices and sign one out on purpose. No new migration is
 involved: `docker compose up -d --build` is the whole upgrade.
 
+**This release moves shared files and requires `ENROLLMENT_HASHES`.** File storage now lives in a `blobs` volume so the storage process can no longer see
+your databases. Links shared in the day before you upgrade stop working, since their bytes stay
+behind in the old place; clear those out once with
+`docker compose exec workerd rm -rf /var/lib/mushroom/blobs`. And `ENROLLMENT_HASHES` no longer
+defaults to `*`: the deployment will not start until you set it (see Licences).
+
 ## Checking it works
 
 The servers answer on both addresses:
@@ -231,15 +244,17 @@ link opens: that exercises the other server and confirms `PUBLIC_BASE`.
 - **`docker compose logs workerd`** first, then `docker compose ps`.
 - **It will not start, saying `PUBLIC_BASE is not set`.** There is no `.env`, or it is not next to
   `compose.yaml`.
-- **Every activation fails.** `ENROLLMENT_HASHES` is a list and the key is not in it. Set it to
-  `*`, or recompute the hash with `printf` rather than `echo`.
+- **Every activation fails.** The key is not in `ENROLLMENT_HASHES`. Recompute its hash with
+  `printf` rather than `echo`, and check it is upper-cased first.
 - **The app says the server cannot be reached.** That is https failing, not Mushroom. Check
   `tailscale serve status`, check the address has no path on the end, and check the two addresses
   are not swapped: file sharing is the bare address, friends is `:8443`.
 - **Share links point at the wrong place.** `PUBLIC_BASE` is wrong. Fix `.env` and run
   `docker compose up -d`. Links already handed out keep the old address.
-- **Activations start failing after a burst.** They are rate limited per source address, and
-  everything behind your proxy looks like one address. Wait a minute.
+- **Activations start failing after a burst.** The box has no way to tell clients apart behind
+  your proxy, so the rate limit is one bucket for everyone: `ACTIVATIONS_PER_HOUR_PER_IP` on
+  friends, `ACTIVATIONS_PER_MINUTE_PER_IP` on file sharing, both in `config.capnp.example`.
+  Wait for the window to pass.
 
 ## Without Docker
 
@@ -261,9 +276,13 @@ cp config.capnp.example config.capnp
 ```
 
 Edit `config.capnp`. Every value needing attention is marked `CHANGE ME`: `PUBLIC_BASE`,
-`ADMIN_TOKEN`, `ENROLLMENT_HASHES` (`*` or a list, as above), and the `uniqueKey` on each storage
+`ADMIN_TOKEN`, `ENROLLMENT_HASHES` (a list, as above), and the `uniqueKey` on each storage
 namespace. A `uniqueKey` is any long random string, and it must be set once and never changed:
-changing it makes existing data unreachable.
+changing it makes existing data unreachable. The file holds the admin token, so keep it private:
+
+```bash
+sudo chown mushroom:mushroom config.capnp && sudo chmod 600 config.capnp
+```
 
 **Do not remove the outbound network restrictions.** They are what keep the deployment from making
 any outbound connection, and the configuration file marks them clearly.

@@ -1,17 +1,16 @@
 // The blob store behind `env.FILES`, on local disk.
 //
-// workerd ships no R2, and its built-in `disk` service cannot stand in: it serves GET and HEAD
-// only, with no DELETE and no Range support (checked in workerd.capnp and server.c++). Both are
-// load-bearing. files-worker deletes on user request, on a magic-byte rejection and in the
-// hourly sweep, and deferring those to a filesystem sweep would leave bytes on disk for up to
-// two days after someone pressed delete. Ranged reads are how the app resumes a download.
+// workerd ships no R2, and its `disk` service can't stand in: GET and HEAD only, no DELETE or
+// Range (checked in workerd.capnp and server.c++). Both matter. files-worker deletes on user
+// request, on a magic-byte rejection and in the hourly sweep; a filesystem sweep instead would
+// leave bytes on disk for up to two days after someone pressed delete. Ranged reads are how the
+// app resumes a download.
 //
-// So: about a hundred lines of node:http and node:fs on a unix socket. No dependencies, nothing
-// listening on a network port, and a ranged read is a seek rather than a stream-and-discard.
+// So: about a hundred lines of node:http and node:fs on a unix socket. No dependencies, no
+// network port, and a ranged read is a seek, not a stream-and-discard.
 //
-// Files reach 95 MiB by default and on-prem is free to raise that (the 95 exists because of a
-// Cloudflare body cap that does not apply here), so EVERY path streams. Nothing here reads a
-// whole object into memory.
+// Files reach 95 MiB by default and on-prem may raise that (the 95 is a Cloudflare body cap that
+// doesn't apply here), so every path streams. Nothing reads a whole object into memory.
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
@@ -21,15 +20,14 @@ if (!process.env.BLOB_ROOT || !SOCKET) {
   console.error("blobd: set BLOB_ROOT and BLOB_SOCKET");
   process.exit(2);
 }
-// RESOLVED, not taken as typed. The containment check below compares a resolved path against
-// this one, so a BLOB_ROOT with a trailing slash or a relative BLOB_ROOT made every key fail
-// it: the whole store then answered "bad key" to everything, which reads as corruption rather
-// than as a config typo. Our own units set an absolute path, but an operator sets this by hand.
+// Resolved, not taken as typed. The containment check below compares against it, so a relative
+// or trailing-slash BLOB_ROOT would fail every key, and "bad key" for everything reads as
+// corruption, not a config typo. Our units set an absolute path, but operators set it by hand.
 const ROOT = path.resolve(process.env.BLOB_ROOT);
 
-/// Keys are built by the Worker as `f/<uuid>`, so this should never reject anything real.
-/// It is here because "should never" is not a security boundary: this process turns a string
-/// off a socket into a filesystem path, and that is exactly the place traversal gets in.
+/// The Worker builds keys as `f/<uuid>`, so this should never reject anything real. But "should
+/// never" isn't a security boundary: this turns a string off a socket into a filesystem path,
+/// exactly where traversal gets in.
 function resolveKey(urlPath) {
   const key = decodeURIComponent(urlPath.replace(/^\/+/, ""));
   if (!key || key.length > 512) return null;
@@ -42,8 +40,8 @@ function resolveKey(urlPath) {
 }
 
 /// `bytes=N-M`, `bytes=N-` and `bytes=-N`, resolved against a known size.
-/// Returns null for a header we do not understand (treat as no range, which is what R2 does)
-/// and "unsatisfiable" for one we understand but cannot serve.
+/// Returns null for a header we don't understand (no range, as R2 does) and "unsatisfiable"
+/// for one we understand but can't serve.
 function parseRange(header, size) {
   const match = /^bytes=(\d*)-(\d*)$/.exec((header ?? "").trim());
   if (!match) return null;
@@ -70,14 +68,31 @@ const send = (res, status, body = "") => {
   res.end(body);
 };
 
+// A throw out of a request listener kills the process, and every transfer in flight with it, so
+// one bad request (a malformed %-escape, a key naming a directory) would be a restart loop.
 const server = http.createServer((req, res) => {
-  const file = resolveKey(new URL(req.url, "http://blob").pathname);
+  try {
+    handle(req, res);
+  } catch (error) {
+    console.error("blobd:", error?.message ?? error);
+    if (res.headersSent) res.destroy();
+    else send(res, 500, "error\n");
+  }
+});
+
+function handle(req, res) {
+  let file;
+  try {
+    file = resolveKey(new URL(req.url, "http://blob").pathname);
+  } catch {
+    file = null;   // decodeURIComponent on a broken escape
+  }
   if (!file) return send(res, 400, "bad key\n");
 
   if (req.method === "PUT") {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    // Write to a temporary name and rename into place, so a failed or truncated upload can
-    // never be served as a whole object. rename(2) is atomic within a filesystem.
+    // Write to a temp name and rename into place, so a failed or truncated upload is never
+    // served as a whole object. rename(2) is atomic within a filesystem.
     const temp = `${file}.${process.pid}.${Date.now()}.part`;
     let written = 0;
     req.on("data", (chunk) => { written += chunk.length; });
@@ -99,9 +114,11 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === "DELETE") {
-    // Missing is success. The Worker deletes on paths that may already have deleted, and R2
-    // does not complain either.
-    fs.rmSync(file, { force: true });
+    // Missing is success: the Worker may delete something already gone, and R2 doesn't complain
+    // either. A directory isn't an object, so it's "missing" too, never removed.
+    let isFile = false;
+    try { isFile = fs.statSync(file).isFile(); } catch {}
+    if (isFile) fs.rmSync(file, { force: true });
     return send(res, 204);
   }
 
@@ -125,22 +142,23 @@ const server = http.createServer((req, res) => {
   const end = range ? range.end : Math.max(0, stat.size - 1);
   const length = stat.size === 0 ? 0 : end - start + 1;
 
-  // Content-Range is always sent, on a 200 as well as a 206. The shim reads the resolved
-  // offsets back off it to populate R2's `.range`, which R2 fills in even for a plain get.
+  // Content-Range is always sent, on a 200 as well as a 206: the shim reads the offsets back to
+  // populate `.range`, which R2 fills in even for a plain get.
   res.writeHead(range ? 206 : 200, {
     "content-type": "application/octet-stream",
     "content-length": String(length),
     "content-range": `bytes ${start}-${end}/${stat.size}`,
   });
   if (req.method === "HEAD" || stat.size === 0) return res.end();
-  return fs.createReadStream(file, { start, end }).pipe(res);
-});
+  // A stream error comes later and outside the try above: end the response rather than crash.
+  return fs.createReadStream(file, { start, end }).on("error", () => res.destroy()).pipe(res);
+}
 
 fs.mkdirSync(ROOT, { recursive: true });
 fs.rmSync(SOCKET, { force: true });
 server.listen(SOCKET, () => console.log(`blobd: ${ROOT} on ${SOCKET}`));
 
-// systemd sends SIGTERM. Close the socket file so a restart does not trip over it.
+// systemd sends SIGTERM. Close the socket file so a restart doesn't trip over it.
 for (const signal of ["SIGTERM", "SIGINT"]) {
   process.on(signal, () => server.close(() => { fs.rmSync(SOCKET, { force: true }); process.exit(0); }));
 }

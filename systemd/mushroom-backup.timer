@@ -4,7 +4,7 @@ Documentation=file:/opt/mushroom/README.md
 
 [Timer]
 OnCalendar=daily
-# Catch up after the box has been off, rather than skipping a night silently.
+# Catch up after the box was off, rather than silently skipping a night.
 Persistent=true
 RandomizedDelaySec=30m
 

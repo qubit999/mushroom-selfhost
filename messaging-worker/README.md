@@ -359,8 +359,8 @@ Enrol the hashes on the box, write the same invented keys into the Keychain, and
 instances at it. `MUSHROOM_FILES_BASE` matters as much as the messaging one: without it file
 sharing still talks to us while Friends does not.
 
-A Docker box needs no step here at all: `ENROLLMENT_HASHES` defaults to `*` and takes both invented
-keys as they are. Only a box restricted to named keys needs their hashes:
+On a test box nobody else can reach, `ENROLLMENT_HASHES=*` takes both invented keys as they are.
+Otherwise enrol their hashes:
 
 ```bash
 printf '%s' 'MADE-UP-KEY-A' | shasum -a 256 | cut -d' ' -f1   # into ENROLLMENT_HASHES, both workers

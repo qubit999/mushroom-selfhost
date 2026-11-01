@@ -10,56 +10,54 @@ using FilesModules = import "dist/files/modules.capnp";
 # Start selfhost/blobd.mjs alongside it, or uploads have nowhere to go. Both have systemd units
 # in selfhost/systemd.
 #
-# This deployment cannot make an outbound request, which is a stronger thing to hand a security
-# team than any application-level allowlist.
+# This deployment can't make an outbound request, a stronger thing to hand a security team than
+# any application-level allowlist.
 #
-# That is enforced by `globalOutbound = "no-internet"` on each worker, and it has to be.
-# LEAVING THE `internet` SERVICE UNDEFINED DOES NOTHING: workerd defaults globalOutbound to a
-# real network service, so a config without these lines reaches the public internet. Verified
-# rather than assumed. Do not delete the service below thinking it is redundant.
+# `globalOutbound = "no-internet"` on each worker enforces that, and it must. Leaving the
+# `internet` service undefined does nothing: workerd defaults globalOutbound to a real network
+# service, so without these lines the config reaches the public internet (verified). Don't delete
+# the service below as redundant.
 
 const config :Workerd.Config = (
   services = [
     (name = "messaging", worker = .messaging),
     (name = "files", worker = .files),
 
-    # Durable Object storage. These directories hold BOTH the message ciphertext and the
-    # databases, which is what makes the backup story two directories and no more.
+    # Durable Object storage. These hold both the message ciphertext and the databases, so a
+    # backup is these two directories.
     (name = "do-messaging", disk = (path = "/var/lib/mushroom/do-messaging", writable = true)),
     (name = "do-files", disk = (path = "/var/lib/mushroom/do-files", writable = true)),
 
-    # The blob store, standing in for R2. NOT a workerd `disk` service: that serves GET and HEAD
-    # only, with no DELETE and no Range, and both are load-bearing here. selfhost/blobd.mjs
-    # listens on this socket.
+    # The blob store, standing in for R2. Not a workerd `disk` service, which serves only GET and
+    # HEAD, with no DELETE or Range; both matter here. selfhost/blobd.mjs listens on this socket.
     (name = "blobs", external = (address = "unix:/run/mushroom/blobd.sock", http = ())),
 
-    # An outbound network that allows nothing. See the note at the top: this is what actually
-    # makes the box unable to phone home, and it is load-bearing rather than decorative.
+    # An outbound network that allows nothing. See the note at the top: this is what keeps the
+    # box from phoning home.
     #
-    # An empty allow list is the whole mechanism. Do not add a `deny` list to "reinforce" it:
-    # workerd rejects denying 'public' at startup and the process dies on a fatal exception.
+    # The empty allow list is the whole mechanism. Don't add a `deny` list to "reinforce" it:
+    # workerd rejects denying 'public' and dies at startup on a fatal exception.
     (name = "no-internet", network = (allow = [])),
   ],
 
   sockets = [
-    # Plain http on loopback. TLS is terminated in front of these, because the app refuses
-    # anything that is not https and Apple's ATS has no exemption in either build.
+    # Plain http on loopback. TLS is terminated in front, because the app refuses anything but
+    # https and Apple's ATS has no exemption in either build.
     #
-    # NOTE THE CROSSING. The FILES worker gets the bare :443 address, because `PUBLIC_BASE` is
-    # the one address that is ever seen by a human who is not running Mushroom: it is baked into
-    # every share link and travels to whoever the file was sent to. Friends takes the port.
+    # Note the crossing: the files worker gets the bare :443 address, because `PUBLIC_BASE` is
+    # the one address seen by people not running Mushroom; it's in every share link. Friends
+    # takes the port.
     #
     #   tailscale serve --bg --https=443  http://127.0.0.1:8081     # file sharing
     #   tailscale serve --bg --https=8443 http://127.0.0.1:8080     # friends
     #
-    # tailscale renews its own certificate, which is why it beats `tailscale cert` plus workerd
-    # TLS sockets. A customer with internal PKI and their own DNS name can use an `https` socket
-    # group with tlsOptions instead.
+    # tailscale renews its own certificate, which beats `tailscale cert` plus workerd TLS
+    # sockets. With internal PKI and your own DNS name, use an `https` socket with tlsOptions.
     (name = "messaging-http", address = "127.0.0.1:8080", http = (), service = "messaging"),
     (name = "files-http", address = "127.0.0.1:8081", http = (), service = "files"),
 
-    # Operator and test surface, on unix sockets only, so they are unreachable over the network
-    # no matter what the proxy in front is configured to forward.
+    # Operator and test surface, on unix sockets only, so they're unreachable over the network
+    # whatever the proxy forwards.
     (name = "messaging-admin", address = "unix:/run/mushroom/admin.sock", http = (),
      service = (name = "messaging", entrypoint = "Admin")),
     (name = "files-admin", address = "unix:/run/mushroom/files-admin.sock", http = (),
@@ -70,7 +68,7 @@ const config :Workerd.Config = (
 const messaging :Workerd.Worker = (
   modules = MessagingModules.modules,
 
-  # Copied from messaging-worker/wrangler.jsonc and must move with it, or the two environments
+  # Copied from messaging-worker/wrangler.jsonc; move them together, or the two environments
   # stop being the same runtime.
   compatibilityDate = "2026-07-25",
   compatibilityFlags = ["nodejs_compat"],
@@ -88,22 +86,27 @@ const messaging :Workerd.Worker = (
     (name = "INBOX", durableObjectNamespace = "UserInbox"),
     (name = "SQL", durableObjectNamespace = "SqlStore"),
 
-    # The whole box shares one activation bucket, because there is no `cf-connecting-ip` behind
-    # a local proxy. A tailnet has no per-IP abuse problem, so this stays only as a
-    # runaway-client bound rather than a real limit.
+    # The whole box shares one activation bucket: behind a local proxy there's no trustworthy
+    # client address. A bound on runaway clients, and a flood can use it up for everyone until
+    # the hour turns.
     (name = "ACTIVATIONS_PER_HOUR_PER_IP", text = "1000"),
 
-    # A public constant, not a secret. Leave it as it is.
+    # A public constant, not a secret. Leave it as is.
     (name = "APPSTORE_APP_APPLE_ID", text = "6792833686"),
 
-    # Leave APNS_* unset. Background notifications are not available on a self-hosted deployment,
-    # and unset is what makes that automatic: no token is stored and no timer is ever armed.
+    # Where the bare root redirects. Empty names nobody and the root 404s. See the files worker
+    # below; dev-config.sh fills both from the same BRAND_URL.
+    (name = "BRAND_URL", text = ""),
 
-    # CHANGE ME. `*` accepts any licence key, which is the recommended setting. To restrict this
-    # deployment to keys you have named, use a space-separated list of hashes instead:
+    # Leave APNS_* unset. Self-hosted deployments have no background notifications, and unset
+    # makes that automatic: no token is stored and no timer is armed.
+
+    # CHANGE ME. Who may activate: a space-separated list of licence key hashes, one per person:
     #   printf '%s' 'THEIR-KEY' | tr '[:lower:]' '[:upper:]' | shasum -a 256
-    # Use printf, never echo: a trailing newline produces a hash that never matches.
-    (name = "ENROLLMENT_HASHES", text = "*"),
+    # Use printf, never echo: a trailing newline produces a hash that never matches. Empty
+    # refuses every activation. `*` accepts any string as a key, so anyone who can reach the
+    # listener activates; use it only where nobody untrusted can.
+    (name = "ENROLLMENT_HASHES", text = ""),
 
     (name = "ADMIN_TOKEN", text = "CHANGE-ME"),
   ],
@@ -125,33 +128,36 @@ const files :Workerd.Worker = (
     (name = "SQL", durableObjectNamespace = "SqlStore"),
     (name = "BLOBS", service = "blobs"),
 
-    # CHANGE ME, and get it right. This goes into every share link this deployment hands out, so
-    # a wrong value gives people links pointing somewhere else for files that live here. Include
-    # the port if you serve files on one, which is why files is the worker that gets :443.
+    # One activation bucket for the box, as on messaging. Higher than hosted's 30 because every
+    # Mac shares it, including the routine re-activations.
+    (name = "ACTIVATIONS_PER_MINUTE_PER_IP", text = "300"),
+
+    # CHANGE ME, and get it right: it's in every share link, so a wrong value sends people
+    # somewhere else for files that live here. Include the port if files use one (which is why
+    # files gets :443).
     #
-    # dev-config.sh substitutes this by matching the literal below. The two move together.
+    # dev-config.sh substitutes this by matching the literal below; change them together.
     (name = "PUBLIC_BASE", text = "https://CHANGE-ME.example.ts.net"),
 
     (name = "APPSTORE_APP_APPLE_ID", text = "6792833686"),
 
     # Where the "this link has expired" and "this file was removed" pages send a visitor, and
-    # where the bare root redirects. Empty means this deployment names nobody: the root answers
-    # 404 and those pages carry no link, which is the right default for a box that has nothing
-    # to do with us. Set it to your own site if you would rather it pointed somewhere.
+    # where the bare root redirects. Empty names nobody: the root 404s and those pages carry no
+    # link, the right default for a box that isn't ours. Set your own site to point somewhere.
     #
-    # docker-entrypoint.sh substitutes this from BRAND_URL in .env. The two move together.
+    # docker-entrypoint.sh substitutes this from BRAND_URL in .env; change them together.
     (name = "BRAND_URL", text = ""),
 
-    # Leave TURNSTILE_SECRET_KEY and the EMAIL binding unset, and the in-app abuse report form
-    # stays off: it needs a Turnstile secret to check the submission and an EMAIL binding to
-    # deliver it. Handle misuse through your own policies and the admin commands instead.
+    # Leave TURNSTILE_SECRET_KEY and the EMAIL binding unset and the abuse report form stays off:
+    # it needs Turnstile to check a submission and EMAIL to deliver it. Handle misuse through
+    # your own policies and the admin commands.
     #
-    # If you do serve your own copy of report.html, add REPORT_ORIGINS as well, comma separated,
-    # or the Worker refuses your page's origin in favour of ours:
+    # If you serve your own report.html, add REPORT_ORIGINS too, comma separated, or the Worker
+    # refuses your page's origin in favour of ours:
     #   (name = "REPORT_ORIGINS", text = "https://intranet.example.com"),
 
     # CHANGE ME. See the note on the messaging worker above.
-    (name = "ENROLLMENT_HASHES", text = "*"),
+    (name = "ENROLLMENT_HASHES", text = ""),
     (name = "ADMIN_TOKEN", text = "CHANGE-ME"),
   ],
 );

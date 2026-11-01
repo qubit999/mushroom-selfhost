@@ -1,50 +1,35 @@
 /// Licence verification for a box that cannot reach Gumroad.
 ///
-/// Phase A needs nothing like this: the customer's Worker has internet, so `verifyLicense`
-/// reaches Gumroad and each employee activates their own key. A Phase B box has no outbound
-/// network at all, by design, so the same call has to be answered locally.
+/// Phase A doesn't need this: the customer's Worker has internet, so `verifyLicense` reaches
+/// Gumroad and each employee activates their own key. A Phase B box has no outbound network by
+/// design, so the same call is answered locally.
 ///
-/// The handoff proposed gating inside `verifyLicense`. That cannot be done without editing the
-/// file Phase B exists to keep unforked: `verifyLicense` is reached from several layers in either worker,
-/// and it is also reached through `credentialHash` on the channel-migration path. Wrapping the
-/// global `fetch` instead means every byte downstream is the ordinary Gumroad path, including
-/// the `licenses` upsert with its blocked-preserving CASE, the seat cap, `source: "gumroad"`,
-/// and identity claiming. Nothing in worker.js moves.
+/// Gating inside `verifyLicense` would fork the file Phase B exists to keep unforked; it's
+/// reached from several layers in either worker, including `credentialHash` on the
+/// channel-migration path. Wrapping global `fetch` keeps everything downstream on the ordinary
+/// Gumroad path: the `licenses` upsert and its blocked-preserving CASE, the seat cap,
+/// `source: "gumroad"`, identity claiming. Nothing in worker.js moves.
 ///
-/// An App Store build could not point at a custom server at all (`ServerBase` returned nil under
-/// #if APPSTORE), so on-prem was the direct build and therefore Gumroad only. That was a fact
-/// about the CLIENT, read as a property of this server, and it was neither: it was a choice to
-/// avoid a review conversation, not something Apple forbids, and `/v1/devices/activate` is an
-/// unauthenticated POST either way. Build 111 removed those guards, so the premise is gone as
-/// well as unsound, and an App Store Mac reaching a self-hosted box is now the ordinary case. Its `app_transaction` branch verifies against the pinned
-/// Apple roots offline, so it never calls `fetch` and never passed through the wrapper below,
-/// and anyone holding an App Store JWS could enrol on a box restricted to named keys.
+/// App Store Macs reach self-hosted boxes too. Their `app_transaction` branch verifies offline
+/// against the pinned Apple roots and never calls `fetch`, so this wrapper alone would let any
+/// App Store JWS enrol on a box restricted to named keys. The list is therefore applied by
+/// `enrolmentAllows` in both workers, to whichever hash a branch produced; this wrapper only
+/// answers Gumroad.
 ///
-/// The list is now applied by `enrolmentAllows` in both workers, to the hash whichever branch
-/// produced, so it covers every credential type and keeps covering them if that client
-/// restriction is ever lifted. This wrapper still answers Gumroad, and no longer carries the
-/// enrolment decision on its own.
+/// Two modes, and no default: the operator picks one.
 ///
-/// TWO MODES, and `*` is the default a container ships with.
+/// A list of hashes is the safe one. `*` accepts any string as a key, so anyone who can reach the
+/// listener enrols, gets a permanent device token and, on files, a quota under this box's name.
+/// The Mac's own Gumroad check doesn't help: the server is the boundary, and a script needs no
+/// Mac. `*` therefore fits only a box nobody untrusted can reach (a tailnet of employees), and
+/// `/admin/licenses/block` is the lever if it goes wrong.
 ///
-/// `*` accepts any key the app presents. That is not a hole, because THE MAC HAS INTERNET EVEN
-/// WHEN THIS BOX DOES NOT: `LicenseManager.activate` requires a Gumroad `success: true` and
-/// `uses <= 3` before a key ever reaches the Keychain, so a key arriving here was already
-/// verified against Gumroad by the machine that owns it. Checking it twice, against a list a
-/// human has to maintain by hand, buys nothing this box can act on: it cannot learn about a
-/// refund either way. Everything the hash is actually USED for is unchanged, because it is an
-/// identifier and not a permit: the `licenses` row, `MAX_DEVICES_PER_LICENSE`, first-claim
-/// identity binding, and `/admin/licenses/block`, which stays the operator's real lever.
+/// A list of hashes restricts the box to named keys. The config holds hashes, never keys (as
+/// both Workers store them), so a leaked config yields nothing usable.
 ///
-/// A list of hashes instead restricts the box to named keys, for an operator who wants that. The
-/// config holds HASHES, never keys, matching what both Workers already store, so a leaked config
-/// file yields nothing usable.
-///
-/// Neither mode is the empty string. With nothing configured this installs NOTHING and every
-/// Gumroad activation is a 503, which is what a half-configured box should do. (`enrolmentAllows`
-/// refuses an empty list too, with a 403, so the App Store branch is no longer the one credential
-/// a box nobody finished setting up still accepted.) The container never gets there: it refuses
-/// to start at all without a `.env`.
+/// Empty is neither mode: this installs nothing and every Gumroad activation is a 503, right
+/// for a half-configured box (`enrolmentAllows` also refuses an empty list, with a 403). The
+/// container refuses to start with it empty.
 
 const VERIFY_URL = "https://api.gumroad.com/v2/licenses/verify";
 
@@ -56,12 +41,12 @@ async function sha256Hex(text) {
 let installed = false;
 
 /// Wrap `globalThis.fetch` so the Gumroad verify URL is answered in process. Everything else
-/// passes through untouched, which on a correctly configured box means it fails, because
-/// `globalOutbound` allows nothing.
+/// passes through, which on a correctly configured box fails, since `globalOutbound` allows
+/// nothing.
 ///
-/// With no hashes configured this installs NOTHING. The call then escapes to a network that
-/// refuses it, `verifyLicense` returns "unreachable", and activation is a 503. Fail closed and
-/// loud is the right behaviour for a box whose operator has not finished setting it up.
+/// With no hashes this installs nothing: the call escapes to a network that refuses it,
+/// `verifyLicense` returns "unreachable", and activation is a 503. Fail closed and loud for an
+/// unfinished setup.
 export function installOfflineGumroad(hashes) {
   if (installed) return;
   const configured = String(hashes ?? "").trim();
@@ -79,18 +64,15 @@ export function installOfflineGumroad(hashes) {
     const url = typeof input === "string" ? input : input?.url;
     if (url !== VERIFY_URL) return passThrough(input, init);
 
-    // Same normalisation both Workers use before hashing a key, so an operator computing a
-    // hash with the documented one-liner gets a match.
+    // The same normalisation both Workers use, so a hash from the documented one-liner matches.
     const key = new URLSearchParams(init?.body ?? "").get("license_key") ?? "";
     const hash = await sha256Hex(key.trim().toUpperCase());
 
-    // `success: false` is what Gumroad sends for a key it does not know, and it lands as
-    // `invalid` and then a 403, exactly as it would hosted.
+    // Gumroad's answer for an unknown key; it becomes `invalid` and a 403, as hosted.
     if (!open && !enrolled.has(hash)) return Response.json({ success: false });
 
-    // No refunded/disputed/chargebacked flags: this box cannot learn about a refund, and
-    // inventing one would be worse than the honest answer. Removing someone is removing their
-    // hash from the config, which is the control an on-prem operator actually has.
+    // No refunded/disputed/chargebacked flags: this box can't learn about refunds, and inventing
+    // one would be worse. To remove someone, the operator removes their hash from the config.
     return Response.json({
       success: true,
       purchase: { sale_id: `selfhost-${hash.slice(0, 16)}` },

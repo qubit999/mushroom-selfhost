@@ -1,8 +1,7 @@
 -- Temporary file sharing: licenses, devices, files.
 --
--- Identity is the LICENSE, never the raw key. We store sha256(key) only, so a database
--- dump cannot be replayed against Gumroad and cannot be traced back to a purchase
--- without the key already in hand.
+-- Identity is the license, never the raw key. Only sha256(key) is stored, so a dump can't be
+-- replayed against Gumroad or traced to a purchase without the key in hand.
 
 CREATE TABLE licenses (
   license_hash TEXT PRIMARY KEY,          -- sha256 hex of the trimmed, uppercased key
@@ -25,10 +24,9 @@ CREATE TABLE devices (
 -- Eviction picks the least-recently-seen device, so this index is the eviction query.
 CREATE INDEX idx_devices_license ON devices(license_hash, last_seen_at);
 
--- The share token is stored in PLAINTEXT, deliberately. The Shared Files window has to
--- re-display the link on the user's other Macs, so it cannot be one-way. The object
--- bytes in R2 are exactly as sensitive as the token that fetches them, so hashing it
--- would protect nothing while breaking the feature.
+-- The share token is stored in plaintext on purpose: the Shared Files window re-displays the
+-- link on the user's other Macs, so it can't be one-way. The R2 bytes are exactly as sensitive
+-- as the token that fetches them, so hashing would protect nothing and break the feature.
 CREATE TABLE files (
   id           TEXT PRIMARY KEY,          -- uuid; the R2 key is 'f/' || id
   license_hash TEXT NOT NULL,

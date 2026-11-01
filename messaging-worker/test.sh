@@ -5,17 +5,16 @@
 #     --var ACTIVATIONS_PER_HOUR_PER_IP:1000
 #   ./test.sh
 #
-# The --var is not optional. Every assertion about the activation branch is a POST to
-# /v1/devices/activate, there are now more than a dozen of them, and the real budget is 10 an
-# hour per IP. Without it the suite spends the budget on itself and everything after it fails
-# as rate_limited, which --persist-to then carries into the next run too. Nothing sets that
-# var in production.
+# The --var is required. Every activation assertion is a POST to /v1/devices/activate, there
+# are over a dozen, and the real budget is 10 an hour per IP. Without it the suite spends the
+# budget itself and everything after fails as rate_limited, which --persist-to carries into
+# the next run. Production never sets it.
 #
-# Runs with NO credentials: it seeds a license and two devices straight into local D1, so
-# everything past the activation phase is identical whether or not Gumroad is reachable.
-# Set MUSHROOM_TEST_LICENSE to also exercise the real activation path.
+# Needs no credentials: it seeds a license and two devices straight into local D1, so
+# everything past activation is the same whether or not Gumroad is reachable. Set
+# MUSHROOM_TEST_LICENSE to also exercise the real activation path.
 #
-# Same logging rule as the Worker: this script prints ids and status codes, never a token.
+# Same logging rule as the Worker: ids and status codes, never a token.
 set -uo pipefail
 
 BASE="${BASE:-http://localhost:8788}"
@@ -36,15 +35,14 @@ status() { curl -s -o "$BODY" -w '%{http_code}' "$@"; }
 code()   { python3 -c 'import json,sys; print(json.load(sys.stdin).get("code",""))' < "$BODY" 2>/dev/null; }
 field()  { python3 -c "import json,sys; print(json.load(sys.stdin).get('$1',''))" < "$BODY" 2>/dev/null; }
 
-# Database access, with two backends, because this suite is also the on-prem conformance suite.
+# Database access has two backends, because this is also the on-prem conformance suite.
 #
 #   ADMIN_SOCK unset -> `wrangler dev`, the hosted reference environment.
 #   ADMIN_SOCK set   -> a self-hosted workerd box (see selfhost/), which has no wrangler and no
 #                       account to reach. Same SQL, posted to the unix-socket admin route.
 #
-# Deliberately the ONLY difference between the two runs. Every assertion below is shared, so a
-# behaviour that differs between hosted and on-prem shows up as a diff in the pass list rather
-# than as a second suite nobody keeps up to date.
+# That's the only difference between the runs. Every assertion is shared, so hosted vs on-prem
+# behaviour shows up as a diff in the pass list, not as a second suite nobody maintains.
 ADMIN_SOCK="${ADMIN_SOCK:-}"
 
 selfhost_sql() {
@@ -80,9 +78,9 @@ if ! curl -sf -o /dev/null "$BASE/" --max-time 5 --max-redirs 0 -w '' 2>/dev/nul
   fi
 fi
 
-# Is there a schema? A database with no tables answers 500 to roughly twenty assertions below
-# and says nothing about why, which is exactly what a deleted state directory looks like.
-# `licenses` comes from the first migration, so its absence means none of them have run.
+# Is there a schema? With no tables, about twenty assertions below answer 500 with no hint why,
+# which is what a deleted state directory looks like. `licenses` comes from the first migration,
+# so its absence means none have run.
 if ! d1_json "SELECT 1 FROM licenses LIMIT 1" >/dev/null 2>&1; then
   echo "The local database has no tables. Apply the migrations first:"
   if [ -n "$ADMIN_SOCK" ]; then
@@ -95,7 +93,10 @@ fi
 
 echo
 echo "unauthenticated"
-want "root redirects to the website"        "302" "$(status -o /dev/null "$BASE/")"
+# A self-hosted root redirects to BRAND_URL, or 404s when the box names nobody.
+ROOT=$(status -o /dev/null "$BASE/")
+if [ -n "$ADMIN_SOCK" ] && [ "$ROOT" = 404 ]; then want "root is 404 (no BRAND_URL)" "404" "$ROOT"
+else want "root redirects to the website" "302" "$ROOT"; fi
 want "an unknown path is not found"         "401" "$(status "$BASE/v1/nope")"
 want "no token is a 401"                    "401" "$(status -X POST "$BASE/v1/invites")"
 want "a junk token is a 401"                "401" "$(status -X POST -H 'authorization: Bearer nope' "$BASE/v1/invites")"
@@ -107,16 +108,15 @@ want "no license is refused"                "bad_request" "$(code)"
 status -X POST "$BASE/v1/devices/activate" -H 'content-type: application/json' \
   -d '{"license_key":"ABC","public_key":"short"}' >/dev/null
 want "a malformed public key is refused"    "bad_public_key" "$(code)"
-# The public key is validated BEFORE Gumroad is called, so this costs no round trip.
+# The public key is validated before Gumroad is called, so this costs no round trip.
 status -X POST "$BASE/v1/devices/activate" -H 'content-type: application/json' \
   -d '{"license_key":"'"$(printf 'x%.0s' {1..200})"'","public_key":"short"}' >/dev/null
 want "an over-long license is refused"      "bad_request" "$(code)"
 
-# The App Store credential. No real AppTransaction JWS exists outside a TestFlight or App
-# Store install, so these pin the SHAPE of the branch: what is refused, and with which code.
-# Here rather than at the end of the file on purpose: activation is throttled per IP
-# (ACTIVATIONS_PER_HOUR_PER_IP) and the seed phase below spends that budget, which would turn
-# every one of these into a 429.
+# The App Store credential. A real AppTransaction JWS only exists inside a TestFlight or App
+# Store install, so these pin the branch's shape: what's refused, and with which code. Here,
+# not at the end: activation is throttled per IP (ACTIVATIONS_PER_HOUR_PER_IP) and the seed
+# phase spends that budget, turning these into 429s.
 PK=$(head -c 32 /dev/urandom | base64)
 A="$BASE/v1/devices/activate"
 post() { status -X POST "$A" -H 'content-type: application/json' -d "$1" >/dev/null; }
@@ -127,23 +127,22 @@ post "{\"license_key\":\"K\",\"app_transaction\":\"aaa.bbb.ccc\",\"public_key\":
 want "both credentials at once is refused"  "bad_request" "$(code)"
 post "{\"app_transaction\":\"$(head -c 13000 /dev/zero | tr '\0' 'a').b.c\",\"public_key\":\"$PK\"}"
 want "an over-long app_transaction refused" "bad_request" "$(code)"
-# `JSON.parse("null")` succeeds, so the try/catch around request.json() never fires and the
-# property reads used to throw a 500.
+# `JSON.parse("null")` succeeds, so the try/catch around request.json() doesn't fire and the
+# property reads would throw a 500.
 post 'null'
 want "a null body is refused"               "bad_request" "$(code)"
 post '[]'
 want "an array body is refused"             "bad_request" "$(code)"
-# These two reach the verifier. bad_license means it ran and refused;
-# appstore_unconfigured would mean APPSTORE_APP_APPLE_ID is unset and the path is dark.
+# These two reach the verifier. bad_license means it ran and refused; appstore_unconfigured
+# would mean APPSTORE_APP_APPLE_ID is unset and the path is dark.
 post "{\"app_transaction\":\"not a jws\",\"public_key\":\"$PK\"}"
 want "a malformed app_transaction refused"  "bad_license" "$(code)"
 post "{\"app_transaction\":\"aaa.bbb.ccc\",\"public_key\":\"$PK\"}"
 want "a forged app_transaction refused"     "bad_license" "$(code)"
 
-# The migration fields never authenticate anything on their own: they only prove, to an
-# identity that is already bound to the OTHER channel's hash, that the caller holds the
-# credential owning it. A request that carries them but no valid primary credential must be
-# refused exactly as it would be without them, or they are a second way in.
+# The migration fields never authenticate on their own: they only prove the caller holds the
+# credential an identity is bound to on the other channel. Without a valid primary credential
+# the request must be refused exactly as without them, or they're a second way in.
 post "{\"migrate_license_key\":\"K\",\"public_key\":\"$PK\"}"
 want "a migration field alone is refused"   "bad_request" "$(code)"
 post "{\"app_transaction\":\"aaa.bbb.ccc\",\"migrate_license_key\":\"K\",\"migrate_app_transaction\":\"a.b.c\",\"public_key\":\"$PK\"}"
@@ -160,9 +159,8 @@ fi
 
 # ---------------------------------------------------------------- seed
 #
-# Two identities on one license, which is also the shape of "three Macs per license".
-# Public keys are 44 base64 characters because that is what 32 raw bytes encode to and the
-# Worker checks the length; the bytes themselves are never used by the server.
+# Two identities on one license, the shape of "several Macs per license". Public keys are 44
+# base64 characters (32 raw bytes) because the Worker checks the length; it never uses the bytes.
 
 ALICE_KEY="QUxJQ0VfXzMyX2J5dGVfcHVibGljX2tleV9fX19fX18="
 BOB_KEY="Qk9CX19fXzMyX2J5dGVfcHVibGljX2tleV9fX19fX18B"
@@ -175,11 +173,10 @@ NOW="$(date +%s)"
 
 d1 "INSERT OR REPLACE INTO licenses (license_hash, status, checked_at, created_at)
     VALUES ('$LICENSE', 'active', $NOW, $NOW);"
-# `license_hash` INCLUDED. `INSERT OR REPLACE` rewrites the whole row, so seeding without it
-# reset the column to NULL on every run and recreated exactly the state migrations 0002/0003
-# exist to eliminate: `activateDevice`'s first-claim-wins check is
-# `if (claimed && claimed.license_hash && ...)`, which a NULL passes, so the check was skipped
-# locally whether or not the code was there to run.
+# `license_hash` included. `INSERT OR REPLACE` rewrites the whole row, so seeding without it
+# resets the column to NULL, the state migrations 0002/0003 exist to eliminate.
+# `activateDevice`'s first-claim check is `if (claimed && claimed.license_hash && ...)`, which a
+# NULL passes, so the check would silently never run locally.
 d1 "INSERT OR REPLACE INTO identities (id, public_key, license_hash, created_at) VALUES
     ('$ALICE_ID', '$ALICE_KEY', '$LICENSE', $NOW), ('$BOB_ID', '$BOB_KEY', '$LICENSE', $NOW);"
 d1 "INSERT OR REPLACE INTO devices (id, identity_id, license_hash, token_hash, name, created_at, last_seen_at) VALUES
@@ -192,17 +189,15 @@ B=(-H "authorization: Bearer $BOB_TOKEN")
 echo
 echo "channel migration"
 
-# A Mac that moves between the direct download and the App Store keeps its Keychain, so the
-# identity key survives while the licence hash under it does not. `migrateIdentity` lets the
-# identity follow its owner, but ONLY to someone who can produce the credential it is bound
-# to. The happy path needs two real credentials at once (a Gumroad key AND an AppTransaction
-# JWS, which only exists inside a TestFlight or App Store install), so it is verified by hand
-# on a TestFlight build. What is pinned here is the half that must never give way: an
-# unprovable migration leaves the binding exactly where it was.
-# 44 base64 characters, because that is what 32 raw bytes encode to and the Worker checks the
-# length before anything else. A 43 character key never reaches the claim check at all: it is
-# refused as bad_public_key, which looks like the migration assertions passing for the wrong
-# reason if you are not watching the code.
+# A Mac moving between the direct download and the App Store keeps its Keychain, so the
+# identity key survives but the licence hash under it doesn't. `migrateIdentity` lets the
+# identity follow its owner, but only for someone who can produce the credential it's bound to.
+# The happy path needs a Gumroad key and an AppTransaction JWS at once (the JWS only exists in a
+# TestFlight or App Store install), so it's checked by hand on TestFlight. Pinned here is the
+# half that must never give: an unprovable migration leaves the binding where it was.
+# 44 base64 characters, because the Worker checks the length first. A 43-character key is
+# refused as bad_public_key before the claim check, which would make the migration assertions
+# pass for the wrong reason.
 MIG_KEY="TUlHUkFURV8zMl9ieXRlX3B1YmxpY19rZXlfX19fX18="
 MIG_ID="$(sha "$MIG_KEY")"
 OTHER="$(sha 'SOME-OTHER-CHANNEL')"
@@ -212,7 +207,7 @@ d1 "INSERT OR REPLACE INTO identities (id, public_key, license_hash, created_at)
 owner() { d1_json "SELECT license_hash FROM identities WHERE id = '$MIG_ID';" |
   python3 -c 'import json,sys; r=json.load(sys.stdin); print(r[0]["license_hash"] if r else "")'; }
 
-# No migration field at all: the original refusal, unchanged.
+# No migration field at all: the plain refusal.
 status -X POST "$BASE/v1/devices/activate" -H 'content-type: application/json' \
   -d "{\"app_transaction\":\"aaa.bbb.ccc\",\"public_key\":\"$MIG_KEY\"}" >/dev/null
 want "a claimed identity is still refused"  "bad_license" "$(code)"
@@ -260,7 +255,7 @@ status -X POST "${B[@]}" -H 'content-type: application/json' \
 want "a code is single use"                 "invite_used" "$(code)"
 
 # Expiry beats used, so an old code reads as expired rather than as someone else's.
-# NB the code has to be spellable in the alphabet: "EXPIRED0" is not, it contains an I.
+# The code must be spellable in the alphabet: "EXPIRED0" isn't, it has an I.
 d1 "INSERT OR REPLACE INTO invites (code, identity_id, expires_at, created_at)
     VALUES ('EXPRED00', '$ALICE_ID', $((NOW - 10)), $((NOW - 100)));"
 status -X POST "${B[@]}" -H 'content-type: application/json' \
@@ -286,15 +281,15 @@ want "a malformed peer id is not a route"   "404" "$(status -X POST "${A[@]}" \
 
 # ---------------------------------------------------------------- sockets
 #
-# Before the rate-limit phase, which deliberately exhausts Alice's invite budget for the
-# day and would otherwise leave the socket suite unable to make a friendship.
+# Before the rate-limit phase, which exhausts Alice's invite budget for the day and would leave
+# the socket suite unable to make a friendship.
 
 if command -v node >/dev/null 2>&1; then
   BASE="$BASE" BOB_IDENTITY="$BOB_ID" node socket-test.mjs "$ALICE_TOKEN" "$BOB_TOKEN"
   SOCKET_STATUS=$?
-  # RE-SEED. The socket suite ends by releasing Bob's device to prove that revocation closes
-  # a live socket, which revokes the token with it. Everything after this point, and the
-  # Swift wire suite that runs against the same seeded tokens, would otherwise get a 401.
+  # Re-seed. The socket suite ends by releasing Bob's device to prove revocation closes a live
+  # socket, which revokes his token. Everything after, and the Swift wire suite using the same
+  # seeded tokens, would otherwise get a 401.
   d1 "INSERT OR REPLACE INTO devices (id, identity_id, license_hash, token_hash, name, created_at, last_seen_at) VALUES
       ('dev-alice', '$ALICE_ID', '$LICENSE', '$(sha "$ALICE_TOKEN")', 'Alice Mac', $NOW, $NOW),
       ('dev-bob',   '$BOB_ID',   '$LICENSE', '$(sha "$BOB_TOKEN")',   'Bob Mac',   $NOW, $NOW);"
@@ -307,13 +302,11 @@ fi
 echo
 echo "device management"
 
-# Reads a field out of the /v1/devices payload. `field()` only reaches top-level scalars and
-# everything interesting here is inside the array.
+# Reads a field from the /v1/devices payload; `field()` only reaches top-level scalars.
 devices() { python3 -c "import json,sys; d=json.load(sys.stdin); print($1)" < "$BODY" 2>/dev/null; }
 
-# A device on a DIFFERENT licence, which is what the scoping assertions below are about.
-# Without one, "revoking someone else's device is refused" would pass against an empty table
-# for the wrong reason.
+# A device on a different licence, for the scoping assertions below. Without one, "revoking
+# someone else's device is refused" would pass against an empty table.
 STRANGER="$(sha 'STRANGER-LICENSE')"
 d1 "INSERT OR REPLACE INTO licenses (license_hash, status, checked_at, created_at)
     VALUES ('$STRANGER', 'active', $NOW, $NOW);"
@@ -323,12 +316,12 @@ d1 "INSERT OR REPLACE INTO devices (id, identity_id, license_hash, token_hash, n
 status "${A[@]}" "$BASE/v1/devices" >/dev/null
 want "the device list is readable"          "2" "$(devices 'len(d["devices"])')"
 want "and reports the seat limit"           "5" "$(devices 'd["limit"]')"
-# Scoped on license_hash, not identity_id: the cap counts per licence, so a list keyed on
-# identity would omit exactly the rows consuming the seats.
+# Scoped on license_hash, not identity_id: the cap counts per licence, so an identity-keyed
+# list would hide the rows using the seats.
 want "another licence is not listed"        "0" "$(devices '''sum(1 for x in d["devices"] if x["id"]=="dev-stranger")''')"
 want "this device is flagged"               "dev-alice" "$(devices '''next(x["id"] for x in d["devices"] if x["this_device"])''')"
-# A token is never returned. It is not even selected, but the assertion is cheap and the rule
-# it protects (ids and status codes only, never a credential) is not.
+# A token is never returned. It isn't even selected, but the assertion is cheap and the rule
+# (never a credential) matters.
 want "no token leaks into the list"         "0" "$(devices '''sum(1 for x in d["devices"] if "token" in x)''')"
 
 status -X POST "${A[@]}" "$BASE/v1/devices/revoke" -H 'content-type: application/json' -d '{}' >/dev/null
@@ -336,8 +329,7 @@ want "revoke needs a device id"             "bad_device" "$(code)"
 status -X POST "${A[@]}" "$BASE/v1/devices/revoke" -H 'content-type: application/json' \
   -d '{"device_id":"dev-alice"}' >/dev/null
 want "revoking yourself is refused"         "cannot_revoke_self" "$(code)"
-# 404 rather than 403, and the same answer as a device id that never existed: a distinguishable
-# code would turn this endpoint into an oracle for whether an id is real.
+# 404, the same as for a device id that never existed, or this is an oracle for real ids.
 status -X POST "${A[@]}" "$BASE/v1/devices/revoke" -H 'content-type: application/json' \
   -d '{"device_id":"dev-stranger"}' >/dev/null
 want "another licence's device is refused"  "not_found" "$(code)"
@@ -352,23 +344,22 @@ want "the revoked device cannot call"       "401" "$(status -X POST "${B[@]}" "$
 status "${A[@]}" "$BASE/v1/devices" >/dev/null
 want "and it is off the list"               "1" "$(devices 'len(d["devices"])')"
 
-# Put Bob back. The rate-limit block below is the only thing after this, but leaving the seed
-# broken would make this suite order-dependent for anything added later.
+# Put Bob back, so anything added later doesn't depend on test order.
 d1 "UPDATE devices SET revoked_at = NULL WHERE id = 'dev-bob';"
-# Proved with a READ. Creating an invite would also prove it and would spend one of Bob's
-# twenty a day, which the rate-limit block below is about to care about.
+# Proved with a read: creating an invite would spend one of Bob's twenty a day, which the
+# rate-limit block below cares about.
 want "bob is restored for later runs"       "200" "$(status "${B[@]}" -o /dev/null "$BASE/v1/friends")"
 
 echo
 echo "setapp activation (inert until the vendor secrets exist)"
 
-# The whole Setapp branch ships BEFORE Setapp is configured, and this is the proof it is inert:
-# with no SETAPP_CLIENT_ID/SECRET set, every setapp activation answers 503 `setapp_unconfigured`,
-# which is the soft code neither client latches. Nothing else in this suite may change either.
+# The Setapp branch ships before Setapp is configured; this proves it's inert. With no
+# SETAPP_CLIENT_ID/SECRET, every setapp activation answers 503 `setapp_unconfigured`, the soft
+# code neither client latches, and nothing else in this suite changes.
 #
-# The JSON is assembled with SINGLE quotes around the braces. Bash brace-expands an unquoted
-# `{a,b,c}` into three words, and inside a `$(...)` the escaping is re-parsed, so the obvious
-# spelling silently sent three malformed requests and every assertion here read 400 bad_request.
+# The JSON has single quotes around the braces. Bash brace-expands an unquoted `{a,b,c}` into
+# three words, and `$(...)` re-parses the escaping, so the obvious spelling sends three
+# malformed requests and every assertion reads 400 bad_request.
 PROBE_KEY="U0VUQVBQXzMyX2J5dGVfcHVibGljX2tleV9fX19fXwE="
 PHONE_KEY="UEhPTkVfXzMyX2J5dGVfcHVibGljX2tleV9fX19fXwE="
 activate() {
@@ -379,8 +370,8 @@ json='{"public_key":"'"$PROBE_KEY"'","device_name":"P","setapp_code":"CODE"}'
 want "an unconfigured deploy refuses softly"  "503" "$(activate "$json")"
 want "and says which half is missing"         "setapp_unconfigured" "$(code)"
 
-# Exactly one credential, now counted over four fields rather than compared as two booleans.
-# Picking a winner silently is how one build ends up authenticating as another's licence.
+# Exactly one credential, counted over four fields. Silently picking a winner is how one build
+# ends up authenticating as another's licence.
 json='{"public_key":"'"$PROBE_KEY"'","device_name":"P","setapp_code":"C","license_key":"K"}'
 want "two credentials at once is refused"     "400" "$(activate "$json")"
 json='{"public_key":"'"$PROBE_KEY"'","device_name":"P"}'
@@ -391,16 +382,16 @@ want "an oversized code is refused"           "400" "$(activate "$json")"
 echo
 echo "pairing link codes"
 
-# A Mac mints a one-time code so a phone can join the licence without holding a credential. This
-# is what makes a Setapp Mac able to pair a phone at all: its own credential is a single-use auth
-# code that only a Worker can exchange, so there is nothing to copy across.
+# A Mac mints a one-time code so a phone can join the licence without a credential. It's how a
+# Setapp Mac pairs a phone at all: its credential is a single-use auth code only a Worker can
+# exchange, so there's nothing to copy across.
 want "a Mac can mint a link code"             "201" "$(status -X POST "${A[@]}" "$BASE/v1/link")"
 LINK_CODE="$(field code)"
 want "and it comes back with an expiry"       "600" "$(field expires_in)"
 if [ -n "$LINK_CODE" ]; then ok "the code is non-empty"; else bad "the code is non-empty"; fi
 
-# Stored hashed, exactly like a device token: for its ten minutes this row is a bearer credential
-# to somebody's Friends identity, and a plaintext table turns a database read into account access.
+# Stored hashed, like a device token: for ten minutes it's a bearer credential to someone's
+# Friends identity, and a plaintext table would turn a database read into account access.
 want "the code is never stored in the clear"  "0" \
   "$(d1 "SELECT COUNT(*) AS n FROM link_codes WHERE code_hash = '$LINK_CODE';" | grep -c '\"n\": 1')"
 
@@ -408,14 +399,14 @@ json='{"public_key":"'"$PHONE_KEY"'","device_name":"Phone","link_code":"'"$LINK_
 want "a phone redeems it and joins"           "201" "$(activate "$json")"
 PHONE_TOKEN="$(field token)"
 
-# SINGLE USE. The DELETE is the claim, so two phones racing one code cannot both be told yes, and
-# a code recovered from a photograph afterwards is worthless.
+# Single use. The DELETE is the claim, so two phones racing one code can't both win, and a code
+# recovered later from a photo is worthless.
 want "the same code cannot be spent twice"    "403" "$(activate "$json")"
 want "and the refusal is bad_license"         "bad_license" "$(code)"
 
-# The phone landed on the SAME licence, which is the entire point: same seats, and an identity
-# the Mac's friends already know. Asserted through the device list rather than by reading the
-# table, because the list is scoped to the caller's licence and is what the user actually sees.
+# The phone landed on the same licence: same seats, and an identity the Mac's friends know.
+# Asserted through the device list, not the table, because the list is scoped to the caller's
+# licence and is what the user sees.
 status "${A[@]}" "$BASE/v1/devices" > /dev/null
 want "the phone is on the Mac's licence"      "1" \
   "$(python3 -c 'import json;print(sum(1 for d in json.load(open("'"$BODY"'"))["devices"] if d["name"]=="Phone"))')"
@@ -423,12 +414,11 @@ want "the phone is on the Mac's licence"      "1" \
 echo
 echo "a lapsed entitlement is told apart from a dead token"
 
-# Two different refusals wear a 401. An unknown token means "activate again"; a LIVE token whose
-# licence is merely past its horizon means "somebody has to re-prove this licence" — and for a
-# link-paired phone that somebody is not itself, so answering `reactivate` there would make it
-# throw away the one token it can never replace.
-# Minted while the licence is still healthy, because minting is an authed call: this is the code
-# the lapse block below tries to spend afterwards.
+# Two refusals share a 401. An unknown token means "activate again"; a live token whose licence
+# is past its horizon means "someone must re-prove this licence". A link-paired phone can't do
+# that itself, so `reactivate` would make it throw away a token it can never replace.
+# Minted while the licence is healthy, since minting is authed; the lapse block below tries to
+# spend it.
 status -X POST "${A[@]}" "$BASE/v1/link" > /dev/null
 json2='{"public_key":"'"$PHONE_KEY"'","device_name":"Phone2","link_code":"'"$(field code)"'"}'
 
@@ -440,14 +430,12 @@ want "but says the entitlement lapsed"        "entitlement_lapsed" "$(code)"
 status -H "authorization: Bearer not-a-real-token" "$BASE/v1/friends" > /dev/null
 want "an unknown token still says reactivate" "reactivate" "$(code)"
 
-# Releasing a seat is cleanup, not access, so it keeps working through a lapse: the seat cap would
-# otherwise be a trap.
+# Releasing a seat is cleanup, not access, so it works through a lapse, or the seat cap is a trap.
 want "release still works while lapsed"       "200" \
   "$(status -X POST -H "authorization: Bearer $PHONE_TOKEN" "$BASE/v1/devices/release")"
 
-# A borrowed activation must never REFRESH the licence row. If it did, a phone could keep a lapsed
-# licence alive forever on the strength of a code minted while it was still good, which is exactly
-# why the link branch skips the upsert rather than sharing it.
+# A borrowed activation must never refresh the licence row, or a phone could keep a lapsed licence
+# alive forever on a code minted while it was good. That's why the link branch skips the upsert.
 want "a link code cannot revive a lapse"      "403" "$(activate "$json2")"
 want "and it says the subscription is needed" "subscription_required" "$(code)"
 want "the licence is still lapsed after that" "401" "$(status "${A[@]}" -o /dev/null "$BASE/v1/friends")"
@@ -460,13 +448,13 @@ d1 "DELETE FROM identities WHERE public_key = '$PHONE_KEY';"
 echo
 echo "apns key parsing (pure, no server)"
 
-# `apnsPEM` is the whole reason push can fail with the alarm reporting Ok: a mangled .p8 threw
-# inside a catch that swallowed it, and no notification was sent on ANY platform for as long as
-# the secret was stored that way. These run the real function out of worker.js.
+# `apnsPEM` is how push can fail while the alarm reports Ok: a mangled .p8 throws inside a catch
+# that swallows it, and no notification goes out on any platform. These run the real function
+# out of worker.js.
 #
-# The ordering assertion is the one that matters. Stripping "everything outside base64" before
-# the escape sequences removes the backslash of `\n` and KEEPS the `n`, which is valid base64,
-# so the key decodes to the wrong bytes instead of failing. That is worse than the outage.
+# The ordering assertion matters most. Stripping non-base64 before the escape sequences drops the
+# backslash of `\n` but keeps the `n` (valid base64), so the key decodes to wrong bytes instead
+# of failing, which is worse than an outage.
 apns_case() {
   node -e '
     const src = require("fs").readFileSync("worker.js","utf8");

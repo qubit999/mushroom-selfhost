@@ -1,33 +1,29 @@
 #!/bin/bash
-# Does an undelivered message arm a push alarm when APNs is NOT configured?
+# Does an undelivered message arm a push alarm when APNs is not configured?
 #
-# It must not, and nothing else in the suite can see this. A deployment with no APNs key is
-# the normal state for anyone running this Worker who is not us: only our own .p8 signs for
-# com.qubit.shroomy.app. `apnsKey` throws for an absent key exactly as it does for a broken
-# one, and `alarm()` used to answer both by re-arming at PUSH_RETRY_MS, so every inbox holding
-# an unacked message woke on a timer forever. On someone else's Cloudflare account that is a
-# bill, charged quietly, for a notification that could never have been sent.
+# It must not, and nothing else in the suite can see this. No APNs key is normal for anyone
+# running this Worker but us: only our .p8 signs for com.qubit.shroomy.app. `apnsKey` throws
+# the same for an absent key as a broken one, and re-arming on both would wake every inbox with
+# an unacked message forever: a quiet bill on someone else's account for a push that can't send.
 #
 # This owns its own server, in both modes.
 #
 #   ./alarm-test.sh                 # against `wrangler dev`, the hosted reference environment
 #   SELFHOST=1 ./alarm-test.sh      # against a workerd box, the way a customer runs it
 #
-# A third question, asked with SELF=1 BOGUS_KEY=1: does a message the user sent to their OWN
-# inbox arm one? It must not. One identity can be activated on several Macs, and the app copies
-# every message it sends to itself so the user's other Macs can show it; if that armed the push
-# alarm, a Mac asleep in another room would announce a message its owner had just typed on the
-# Mac in front of them, once per message, forever. BOGUS_KEY is not optional there: with APNs
-# unconfigured the whole branch is skipped for every message and the answer means nothing.
+# A third question, with SELF=1 BOGUS_KEY=1: does a message the user sent to their own inbox
+# arm one? It must not. The app copies every sent message to itself so the user's other Macs
+# can show it; if that armed a push, a Mac asleep in another room would announce what its owner
+# just typed, once per message. BOGUS_KEY is required there: with APNs unconfigured the branch
+# is skipped for every message and the answer means nothing.
 #
-# In wrangler mode the answer lives in workerd's `_cf_ALARM` table, which can only be read once
-# the process has let go of the file, which is why this waits and then kills the server.
+# In wrangler mode the answer is in workerd's `_cf_ALARM` table, readable only once the process
+# lets go of the file, hence waiting and then killing the server.
 #
-# In SELFHOST mode it asks the inbox object instead, over the unix-socket admin route. That is
-# not merely a port: the file probe has to sum across every inbox because it cannot tell them
-# apart, while the route answers for ONE named identity, so "the message was stored" means
-# stored in the inbox it was addressed to. It also survives a workerd storage-layout change,
-# which the `v3/do/` path below will not.
+# In SELFHOST mode it asks the inbox object over the unix-socket admin route. The file probe has
+# to sum across inboxes it can't tell apart; the route answers for one named identity, so
+# "stored" means stored in the addressed inbox. It also survives a workerd storage-layout change,
+# which the `v3/do/` path below won't.
 #
 # Same logging rule as the Worker: ids and status codes, never a token.
 set -uo pipefail
@@ -62,11 +58,11 @@ if [ "$SELFHOST" = "1" ]; then
   if [ ! -f ../dist/messaging/entry.js ]; then
     echo "  FAIL  no bundle. Run: (cd .. && ./build.sh)"; exit 1
   fi
-  # Migrations are applied by the SqlStore constructor on first use, so there is no apply step.
+  # The SqlStore constructor applies migrations on first use, so there's no apply step.
   #
-  # The config has to live in selfhost/, not in the state dir: capnp resolves `import` relative
-  # to the importing file and the config imports dist/messaging/modules.capnp. Writing it to
-  # $STATE loads nothing and reports only "server never came up".
+  # The config must live in selfhost/, not the state dir: capnp resolves `import` relative to the
+  # importing file, and it imports dist/messaging/modules.capnp. In $STATE it loads nothing and
+  # only reports "server never came up".
   CONFIG="../.test-$$.capnp"
   STATE="$STATE" SOCK="$SOCK" PORT="$PORT" TEST_SQL=1 BOGUS_APNS="${BOGUS_KEY:-0}" \
     ../dev-config.sh > "$CONFIG"
@@ -76,9 +72,8 @@ if [ "$SELFHOST" = "1" ]; then
 else
   npx wrangler d1 migrations apply "$DB" --local --persist-to "$STATE" >/dev/null 2>&1
 
-  # APNS_KEY_P8 is passed in by the caller, or left unset. Unset is the default case this suite
-  # was written for; BOGUS_KEY=1 sets a key that is present but cannot sign, which is the other
-  # failure the retry budget exists for.
+  # APNS_KEY_P8 comes from the caller or stays unset (the default case). BOGUS_KEY=1 sets a key
+  # that's present but can't sign, the other failure the retry budget exists for.
   APNS_ARG=()
   if [ "${BOGUS_KEY:-0}" = "1" ]; then
     APNS_ARG=(--var "APNS_KEY_P8:not-a-real-key" --var "APNS_KEY_ID:AAAA" --var "APNS_TEAM_ID:BBBB")
@@ -91,8 +86,10 @@ else
 fi
 trap 'kill $DEV 2>/dev/null; rm -rf "$STATE"' EXIT
 
-for _ in $(seq 1 90); do curl -sf -o /dev/null --max-time 2 "$BASE/" && break; sleep 1; done
-if ! curl -sf -o /dev/null --max-time 2 "$BASE/"; then
+# Any HTTP answer means it's up: a self-hosted root with no BRAND_URL is a 404, not a redirect.
+up() { [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$BASE/")" != "000" ]; }
+for _ in $(seq 1 90); do up && break; sleep 1; done
+if ! up; then
   echo "  FAIL  server never came up; see $STATE/dev.log"; exit 1
 fi
 
@@ -119,7 +116,7 @@ CODE=$(curl -s -X POST "${A[@]}" "$BASE/v1/invites" |
 curl -s -o /dev/null -X POST "${B[@]}" -H 'content-type: application/json' \
   -d "{\"code\":\"$CODE\"}" "$BASE/v1/invites/accept"
 
-# SELF=1 sends to Alice's OWN inbox instead of Bob's, so the push token has to go there too:
+# SELF=1 sends to Alice's own inbox instead of Bob's, so the push token goes there too:
 # `alarm()` reads the tokens of the inbox holding the message.
 if [ "${SELF:-0}" = "1" ] && [ "${BOGUS_KEY:-0}" != "1" ]; then
   printf '  \033[31mFAIL\033[0m SELF=1 needs BOGUS_KEY=1, or the branch under test is skipped for every message\n'
@@ -127,8 +124,8 @@ if [ "${SELF:-0}" = "1" ] && [ "${BOGUS_KEY:-0}" != "1" ]; then
 fi
 if [ "${SELF:-0}" = "1" ]; then TARGET_ID="$ALICE_ID"; PUSH=("${A[@]}"); else TARGET_ID="$BOB_ID"; PUSH=("${B[@]}"); fi
 
-# The recipient needs a push token, or `alarm()` returns on an empty target list and would look
-# fixed for the wrong reason.
+# The recipient needs a push token, or `alarm()` returns on an empty target list and looks fixed
+# for the wrong reason.
 curl -s -o /dev/null -X POST "${PUSH[@]}" -H 'content-type: application/json' \
   -d "{\"token\":\"$(printf 'a%.0s' {1..64})\",\"environment\":\"sandbox\"}" "$BASE/v1/push"
 
@@ -139,9 +136,8 @@ sleep 20   # PUSH_GRACE_MS is 10s, so an armed alarm has fired and re-armed by n
 NOW_MS=$(( $(date +%s) * 1000 ))
 
 if [ "$SELFHOST" = "1" ]; then
-  # No kill needed: the object answers while it is running, which is the point of asking it
-  # rather than reading its files. The same "refuse to pass vacuously" rule applies, so a probe
-  # that does not answer, or answers something the wrong shape, is a failure and not a zero.
+  # No kill needed: the object answers while running, which is why we ask it instead of reading
+  # files. Same "never pass vacuously" rule: no answer, or the wrong shape, is a failure, not 0.
   PROBE="$STATE/probe.json"
   if ! curl -sf --unix-socket "$SOCK" -m 10 -o "$PROBE" \
        "http://local/_selfhost/inbox?identity=$BOB_ID" 2>/dev/null; then
@@ -171,18 +167,16 @@ if [ "${KEEP:-0}" = "1" ]; then trap - EXIT; echo "  (state kept at $STATE)"
 else trap 'rm -rf "$STATE"' EXIT; fi
 
 META="$STATE/v3/do/mushroom-messaging-UserInbox/metadata.sqlite"
-# Assert the table is READABLE before trusting a count from it. Without this, a workerd storage
-# layout bump (v3 -> v4), a renamed table or a moved namespace directory makes sqlite3 fail,
-# `${ALARMS:-0}` becomes 0, and the scenario this file is named for reports ok forever while
-# asserting nothing.
+# Assert the table is readable before trusting its count. Otherwise a workerd layout bump
+# (v3 -> v4), a renamed table or a moved namespace makes sqlite3 fail, `${ALARMS:-0}` becomes 0,
+# and this file's scenario reports ok forever while asserting nothing.
 if ! sqlite3 "$META" "SELECT COUNT(*) FROM _cf_ALARM;" >/dev/null 2>&1; then
   printf '  \033[31mFAIL\033[0m cannot read _cf_ALARM at %s: this suite would pass vacuously\n' "$META"
   exit 1
 fi
 ALARMS=$(sqlite3 "$META" "SELECT COUNT(*) FROM _cf_ALARM;" 2>/dev/null)
-# Same readability rule as the _cf_ALARM probe above, and for the same reason: an unexpanded
-# glob, a renamed table or a missing sqlite3 all yield an empty count, `${c:-0}` turns that into
-# a zero, and "no push token stored" would be reported having checked nothing.
+# Same readability rule as above: an unexpanded glob, renamed table or missing sqlite3 gives an
+# empty count, `${c:-0}` makes it zero, and "no push token stored" would check nothing.
 TOKENS=0
 INBOXES=0
 for f in "$STATE"/v3/do/mushroom-messaging-UserInbox/*.sqlite; do
@@ -199,7 +193,7 @@ if [ "$INBOXES" -eq 0 ]; then
   printf '  \033[31mFAIL\033[0m no inbox databases found under %s\n' "$STATE/v3/do/mushroom-messaging-UserInbox"
   exit 1
 fi
-# scheduled_time is nanoseconds. How far out the NEXT attempt is, in seconds.
+# scheduled_time is nanoseconds. How far out the next attempt is, in seconds.
 NEXT_IN=$(sqlite3 "$META" \
   "SELECT CAST((MAX(scheduled_time)/1000000 - $NOW_MS)/1000 AS INT) FROM _cf_ALARM;" 2>/dev/null)
 STORED=0
@@ -217,9 +211,8 @@ fi
 printf '  \033[32mok\033[0m   the message was stored (%s)\n' "$STORED"
 
 if [ "${SELF:-0}" = "1" ]; then
-  # The control that stops this passing for the wrong reason. APNs IS configured here, and a
-  # token IS stored in the inbox holding the message, so the only thing standing between this
-  # message and an armed alarm is that it came from the identity it was sent to.
+  # The control against passing for the wrong reason: APNs is configured and a token is stored
+  # in the message's inbox, so only the sender being the recipient keeps the alarm unarmed.
   if [ "${TOKENS:-0}" -lt 1 ]; then
     printf '  \033[31mFAIL\033[0m no push token stored, so nothing could have been pushed at anyway\n'
     exit 1
@@ -234,18 +227,17 @@ if [ "${SELF:-0}" = "1" ]; then
 fi
 
 if [ "${BOGUS_KEY:-0}" = "1" ]; then
-  # A key that cannot sign SHOULD retry: the failures this retry was written for (a throttled
-  # provider token, a 5xx) look identical here and do come back.
+  # A key that can't sign should retry: the failures retry is for (a throttled provider token,
+  # a 5xx) look identical here and do recover.
   if [ "${ALARMS:-0}" -eq 0 ]; then
     printf '  \033[31mFAIL\033[0m a signing failure gave up immediately; transient APNs errors would never retry\n'
     exit 1
   fi
   printf '  \033[32mok\033[0m   a failing key still retries (next attempt in ~%ss)\n' "${NEXT_IN:-?}"
 
-  # The assertion with teeth. A flat re-arm and a counted one are indistinguishable on the
-  # FIRST retry, because the first backoff is PUSH_RETRY_MS either way. What separates them is
-  # that the counted one persisted an attempt number, which is the only reason it can ever
-  # stop. No counter means no budget means the loop is unbounded again.
+  # The assertion with teeth. A flat re-arm and a counted one look the same on the first retry
+  # (both wait PUSH_RETRY_MS); only the counted one persists an attempt number, which is what
+  # lets it stop. No counter, no budget, an unbounded loop.
   if [ "$SELFHOST" != "1" ]; then
     ATTEMPTS=0
     for f in "$STATE"/v3/do/mushroom-messaging-UserInbox/*.sqlite; do
@@ -262,9 +254,8 @@ if [ "${BOGUS_KEY:-0}" = "1" ]; then
   exit 1
 fi
 
-# The token is refused upstream now, which is what makes the two guards belt-and-braces rather
-# than the mechanism: with nothing stored, `alarm`'s target list is provably empty. Assert that
-# directly, because it is the invariant the alarm assertion below now rests on.
+# The token is refused upstream, so `alarm`'s target list is provably empty and the two guards
+# are backup. Assert that directly: the alarm assertion below rests on it.
 if [ "$TOKENS" -ne 0 ]; then
   printf '  \033[31mFAIL\033[0m %s push token(s) stored on a deployment that cannot push\n' "$TOKENS"
   exit 1

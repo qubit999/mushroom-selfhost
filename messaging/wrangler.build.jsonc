@@ -1,19 +1,17 @@
 {
-  // Build-only config. This never deploys anything: it exists so that
-  // `wrangler deploy --dry-run --outdir` produces the on-prem bundle with the SAME bundler
-  // that produces the hosted one. Do not add routes, D1 ids or secrets here.
+  // Build-only; never deploys. It lets `wrangler deploy --dry-run --outdir` build the on-prem
+  // bundle with the same bundler as the hosted one. No routes, D1 ids or secrets here.
   //
-  // compatibility_date and compatibility_flags are copied from messaging-worker/wrangler.jsonc
-  // and must move with it, or the two environments stop being the same runtime.
+  // compatibility_date and compatibility_flags are copied from messaging-worker/wrangler.jsonc;
+  // move them together, or the two environments stop being the same runtime.
   "name": "mushroom-messaging-selfhost",
   "main": "entry.js",
   "compatibility_date": "2026-07-25",
   "compatibility_flags": ["nodejs_compat"],
 
-  // Migrations travel in the bundle as text and are applied by the SqlStore constructor,
-  // because on-prem has no wrangler and no network to reach an account with. No "rules" entry
-  // is needed: wrangler's DEFAULT Text rule already covers **/*.sql, and restating it only
-  // shadows the default and earns a warning.
+  // Migrations travel in the bundle as text and the SqlStore constructor applies them, since
+  // on-prem has no wrangler or network. No "rules" entry: wrangler's default Text rule covers
+  // **/*.sql, and restating it shadows the default and earns a warning.
 
   "durable_objects": {
     "bindings": [

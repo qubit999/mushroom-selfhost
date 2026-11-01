@@ -1,9 +1,9 @@
 {
-  // Build-only. See selfhost/messaging/wrangler.build.jsonc for the reasoning; nothing here
-  // deploys and nothing here carries an id, a route or a secret.
+  // Build-only (see selfhost/messaging/wrangler.build.jsonc): nothing deploys, and no ids,
+  // routes or secrets.
   //
-  // compatibility_date and compatibility_flags are copied from files-worker/wrangler.jsonc and
-  // must move with it.
+  // compatibility_date and compatibility_flags are copied from files-worker/wrangler.jsonc;
+  // move them together.
   "name": "mushroom-files-selfhost",
   "main": "entry.js",
   "compatibility_date": "2026-07-25",
@@ -14,7 +14,7 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SqlStore"] }],
 
-  // The blob sidecar stands in for R2. Declared here so the bundler knows the binding exists;
-  // the capnp points it at the unix socket blobd listens on.
+  // The blob sidecar stands in for R2. Declared so the bundler knows the binding; the capnp
+  // points it at blobd's unix socket.
   "services": [{ "binding": "BLOBS", "service": "blobs" }]
 }

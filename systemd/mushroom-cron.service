@@ -13,8 +13,8 @@ ExecStart=/opt/mushroom/cron.sh
 Environment=ADMIN_SOCK=/run/mushroom/admin.sock
 Environment=FILES_ADMIN_SOCK=/run/mushroom/files-admin.sock
 Environment=BLOB_ROOT=/var/lib/mushroom/blobs
-# Must match TTL_SECONDS in files-worker/worker.js. The blob backstop deletes at twice this,
-# and a value larger than the real lifetime would delete files that are still live.
+# Must match TTL_SECONDS in files-worker/worker.js. The blob backstop deletes at twice this, so
+# a value below the real lifetime would delete files that are still live.
 Environment=TTL_HOURS=24
 
 NoNewPrivileges=yes

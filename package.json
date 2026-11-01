@@ -1,8 +1,11 @@
 {
   "name": "mushroom-selfhost",
   "private": true,
-  "description": "Runs the two Workers on hardware a customer owns. workerd is the production self-hosting runtime, NOT Miniflare, which is a test simulator. Pinned exactly, same rule as every other dependency in this project (CLAUDE.md section 12): a range here would let a clean checkout resolve the runtime holding a company's messages to whatever is newest that day.",
+  "description": "Runs the two Workers on hardware a customer owns. workerd is the production self-hosting runtime, NOT Miniflare, which is a test simulator. Pinned exactly, same rule as every other dependency in this project (CLAUDE.md section 12): a range here would let a clean checkout resolve the runtime holding a company's messages to whatever is newest that day. wrangler is the build-time bundler only (build.sh), pruned from the image after the build.",
   "dependencies": {
     "workerd": "1.20260801.1"
+  },
+  "devDependencies": {
+    "wrangler": "4.156.0"
   }
 }

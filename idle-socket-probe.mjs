@@ -1,16 +1,14 @@
 // Does a proxy in front of the box keep a hibernated WebSocket alive?
 //
-// The one thing the existing suites cannot answer. socket-test.mjs opens sockets, exchanges
-// frames and closes within seconds, so it never reaches the idle timeout of whatever is
-// terminating TLS. Mushroom's sockets are held open for hours: the inbox hibernates them, and
-// a proxy that quietly drops an idle connection degrades messaging in a way that only appears
-// long after a deployment looks fine.
+// The existing suites can't answer this: socket-test.mjs finishes within seconds, never reaching
+// the idle timeout of whatever terminates TLS. Mushroom's sockets stay open for hours (the inbox
+// hibernates them), and a proxy that quietly drops idle connections degrades messaging long after
+// a deployment looks fine.
 //
 // Usage:
 //   BASE=https://box ALICE=<token> BOB=<token> BOB_ID=<hex> node idle-socket-probe.mjs [seconds]
 //
-// Node 22+, global WebSocket, no dependencies. Same rule as everything else here: prints ids
-// and states, never a token.
+// Node 22+, global WebSocket, no dependencies. Prints ids and states, never a token.
 const BASE = process.env.BASE;
 const ALICE = process.env.ALICE;
 const BOB = process.env.BOB;
@@ -39,8 +37,8 @@ const alice = await open(ALICE);
 const bob = await open(BOB);
 ok("both sockets opened over the proxy");
 
-// Nothing is sent during the wait. That is the point: any keepalive the proxy needs has to
-// come from the connection itself, not from traffic this probe generates.
+// Nothing is sent during the wait, on purpose: any keepalive the proxy needs must come from the
+// connection itself, not from this probe's traffic.
 console.log(`  ... holding both sockets idle for ${IDLE_SECONDS}s, sending nothing`);
 const closes = [];
 for (const [name, socket] of [["alice", alice], ["bob", bob]]) {
@@ -54,16 +52,16 @@ if (closes.length) {
   ok(`both sockets still open after ${IDLE_SECONDS}s idle`);
 }
 
-// Surviving is not enough: the socket has to still WORK. A half-open connection that neither
-// side has noticed looks identical to a healthy one until a message is dropped by it.
+// Surviving isn't enough; the socket must still work. A half-open connection neither side has
+// noticed looks healthy until it drops a message.
 const delivered = new Promise((resolve) => {
   bob.addEventListener("message", (event) => {
     const frame = JSON.parse(event.data);
     if (frame.t === "message") resolve({ kind: "message", frame });
   });
-  // A malformed frame comes back as `rejected` on the SENDER's socket. Watching for it turns a
-  // probe bug into an error that says what was wrong, instead of a 20 second timeout that
-  // reads exactly like a proxy dropping messages. It did, once.
+  // A malformed frame comes back as `rejected` on the sender's socket. Watching for it turns a
+  // probe bug into a clear error instead of a 20-second timeout that looks exactly like a proxy
+  // dropping messages.
   alice.addEventListener("message", (event) => {
     const frame = JSON.parse(event.data);
     if (frame.t === "rejected") resolve({ kind: "rejected", frame });
