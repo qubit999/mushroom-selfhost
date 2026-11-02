@@ -33,7 +33,7 @@ nowhere else. Half the storage, and no second copy to diverge.
 | | |
 |---|---|
 | `POST /v1/devices/activate` | `{license_key, public_key, device_name}` -> `{device_id, identity_id, token, limits}` |
-| `GET /v1/connect?token=` | WebSocket upgrade. `&presence=0` to stay invisible |
+| `GET /v1/connect` | WebSocket upgrade, token in `Authorization: Bearer`. `?presence=0` to stay invisible |
 | `POST /v1/invites` | -> `{code, expires_at}` |
 | `POST /v1/invites/accept` | `{code}` -> `{peer_id, public_key}` |
 | `GET /v1/sync?after=<seq>` | -> `{messages[], has_more}` |

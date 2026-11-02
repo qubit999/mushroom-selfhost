@@ -20,6 +20,9 @@ const now = () => Math.floor(Date.now() / 1000);
 /// One declaration for both Workers: two schedules would make a Mac re-activate twice as often.
 export const LICENSE_RECHECK_SECONDS = 7 * 24 * 60 * 60;
 
+/// Grace past a sandbox subscription's expiry. See `verifyAppSubscription`.
+const SANDBOX_SLACK_SECONDS = 24 * 60 * 60;
+
 /// When an App Store buyer's entitlement runs out: `null` for forever, or "lapsed" for "not
 /// grandfathered". "lapsed" isn't a refusal by itself: `activateDevice` then looks for a live
 /// StoreKit subscription or a redeemed website membership.
@@ -96,7 +99,9 @@ export async function verifyAppSubscription(jws, env, expectedAppTransactionID, 
     return verdict("unconfigured");
   }
 
-  for (const verifier of verifiers) {
+  for (const [index, verifier] of verifiers.entries()) {
+    // `verifiersFor` returns Production then Sandbox.
+    const sandbox = index > 0;
     let tx;
     try {
       tx = await verifier.verifyAndDecodeTransaction(jws);
@@ -124,14 +129,22 @@ export async function verifyAppSubscription(jws, env, expectedAppTransactionID, 
     // Refusing on the raw date answers 403 `subscription_required` to a subscriber mid-retry,
     // which both clients latch and persist (`markNotEntitled` / `markNoServerFeatures`, plus
     // `activationBlocked`). CLAUDE.md §12: "never lock a paying user out".
+    //
+    // Sandbox gets a day. Anyone with a TestFlight build can buy there for free, and a week per
+    // free purchase is a free membership. Not zero: accelerated renewals stop within about an
+    // hour, and App Review mid-session must not see Friends refused.
     const expires = typeof tx.expiresDate === "number" ? tx.expiresDate : 0;
-    if (expires <= Date.now() - LICENSE_RECHECK_SECONDS * 1000) return verdict("invalid");
+    const slack = sandbox ? SANDBOX_SLACK_SECONDS : LICENSE_RECHECK_SECONDS;
+    if (expires <= Date.now() - slack * 1000) return verdict("invalid");
     // The same horizon a Gumroad membership gets, never Apple's own expiry. Apple refunds are
     // invisible here (that needs App Store Server Notifications V2 and a webhook), so a yearly
     // transaction's `expiresDate` would be a horizon up to 365 days out that nothing could take
     // back. The client re-activates when it lapses and presents whatever
     // `Transaction.currentEntitlements` holds then: the renewal, or nothing.
-    return verdict("active", now() + LICENSE_RECHECK_SECONDS);
+    //
+    // Capped at expiry plus the slack, so a lapsed subscriber activating near the end of the
+    // grace window gets what's left of it, not a fresh week.
+    return verdict("active", Math.min(now() + LICENSE_RECHECK_SECONDS, Math.floor(expires / 1000) + slack));
   }
   return verdict("invalid");
 }

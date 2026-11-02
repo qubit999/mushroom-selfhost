@@ -22,7 +22,9 @@
   // file as a static asset and matches assets before code, so a file named like a route
   // would silently shadow it. This worker is code only.
 
-  "observability": { "enabled": true },
+  // Invocation logs off: each one records `<METHOD> <URL>`, and every download URL carries a
+  // live share token (`/f/<token>`). Our own console.log lines still land in Workers Logs.
+  "observability": { "enabled": true, "logs": { "enabled": true, "invocation_logs": false } },
 
   // No "ratelimits" binding, on purpose. The per-IP cap on /v1/devices/activate is a D1 counter
   // in worker.js, because Cloudflare's Rate Limiting binding didn't enforce on this account: 139

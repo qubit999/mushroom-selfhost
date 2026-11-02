@@ -2,7 +2,8 @@
 # End-to-end check of the subscription entitlement, against a running `wrangler dev`.
 #
 #   Terminal 1:  npx wrangler d1 migrations apply mushroom-files --local --persist-to ../.wrangler-dev-state
-#                npx wrangler dev --local --persist-to ../.wrangler-dev-state
+#                npx wrangler dev --local --persist-to ../.wrangler-dev-state \
+#                  --var ACTIVATIONS_PER_HOUR_PER_IP:1000
 #   Terminal 2:  ./test-entitlement.sh
 #
 # Separate from test.sh on purpose: that's also the on-prem conformance suite, run against a

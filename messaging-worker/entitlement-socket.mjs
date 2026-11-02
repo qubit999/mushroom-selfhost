@@ -41,7 +41,7 @@ const bad = (label, detail) => {
   return 1;
 };
 
-const socket = new WebSocket(`${BASE.replace(/^http/, "ws")}/v1/connect?token=${token}`);
+const socket = new WebSocket(`${BASE.replace(/^http/, "ws")}/v1/connect`, { headers: { authorization: `Bearer ${token}` } });
 
 const settled = (ms) => new Promise((resolve) => {
   let done = false;

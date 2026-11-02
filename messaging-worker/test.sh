@@ -380,6 +380,13 @@ json='{"public_key":"'"$PROBE_KEY"'","device_name":"P","setapp_code":"'"$(printf
 want "an oversized code is refused"           "400" "$(activate "$json")"
 
 echo
+# A token in the URL would land in Workers Logs, so the socket takes it from the header only.
+want "a socket token in the URL is refused"    "401" "$(status -o /dev/null \
+  -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
+  -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' "$BASE/v1/connect?token=$ALICE_TOKEN")"
+want "a JSON null body is 400, not 500"        "400" "$(status -X POST "${A[@]}" \
+  -H 'content-type: application/json' -d 'null' "$BASE/v1/invites/accept")"
+
 echo "pairing link codes"
 
 # A Mac mints a one-time code so a phone can join the licence without a credential. It's how a

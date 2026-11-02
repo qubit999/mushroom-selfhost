@@ -36,6 +36,9 @@ const REPORT_REASONS = ["malware", "phishing", "copyright", "illegal", "privacy"
 const REPORT_DEDUPE_SECONDS = 24 * 60 * 60;   // same file + same reason inside a day
 const MAX_REPORTS_PER_FILE_PER_DAY = 5;
 const MAX_DETAILS_CHARS = 1000;
+// The whole report form: the Turnstile token, the link, the contact fields and the details, with
+// room for multipart overhead and UTF-8.
+const MAX_REPORT_BYTES = 16 * 1024;
 const MAX_REPORTER_NAME_CHARS = 100;
 const MAX_REPORTER_EMAIL_CHARS = 200;
 const REPORT_CONTACT_SECONDS = 30 * 24 * 60 * 60;    // then name/email are cleared
@@ -290,6 +293,7 @@ async function verifyLicenseAgainst(key, productID, env) {
 import { APPSTORE_BUNDLE_ID, APPLE_ROOT_CA_G3, APPLE_ROOT_CA_G2 } from "../worker-shared/apple-roots.js";
 // The entitlement rules are shared for the same reason: the workers gate different features on
 // one membership, so a rule that differs between them keeps one feature and drops the other.
+import { clientBucket } from "../worker-shared/client-bucket.js";
 import { LICENSE_RECHECK_SECONDS, appStoreEntitlement, verifyAppSubscription,
          entitlementMisconfigured,
          SETAPP_RECHECK_SECONDS, setappMisconfigured, verifySetappAccess }
@@ -416,7 +420,7 @@ async function verifyAppTransaction(jws, env) {
   }
 
   const failures = [];
-  for (const verifier of verifiers) {
+  for (const [index, verifier] of verifiers.entries()) {
     try {
       const tx = await verifier.verifyAndDecodeAppTransaction(jws);
       // The verifier already checked bundleId. `appTransactionId` is what we need and it's
@@ -424,7 +428,11 @@ async function verifyAppTransaction(jws, env) {
       if (typeof tx.appTransactionId === "string" && tx.appTransactionId) {
         // Ms since epoch when this Apple Account first bought the app. Optional, and null must
         // never read as "bought recently": see appStoreEntitlement.
-        const bought = typeof tx.originalPurchaseDate === "number" ? tx.originalPurchaseDate : null;
+        // A sandbox AppTransaction (verifier 1) is never grandfathered: TestFlight hands them out
+        // free, and one dated before the cutover would otherwise be a lifetime entitlement.
+        // App Review is unaffected; it already buys after the cutover.
+        const bought = index > 0 ? Date.now()
+          : typeof tx.originalPurchaseDate === "number" ? tx.originalPurchaseDate : null;
         return verdict("active", tx.appTransactionId, bought);
       }
       failures.push("no_app_transaction_id");
@@ -439,11 +447,19 @@ async function verifyAppTransaction(jws, env) {
   return verdict("invalid");
 }
 
+/// A JSON body that is an object, or a throw the caller's catch turns into 400. `null`, a number
+/// or an array parse fine, and the next `body.x` would be an uncaught 500.
+function objectBody(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  throw new TypeError("body is not an object");
+}
+
 // ---------------------------------------------------------------- throttle
 
-// Overridable for self-hosted boxes, where every client shares one bucket (see the activate
-// route); hosted keeps the default.
-const activationsPerMinutePerIP = (env) => Number(env.ACTIVATIONS_PER_MINUTE_PER_IP ?? 30) || 30;
+// Per hour, like mushroom-messaging, and for the same reason: activation answers before
+// authentication, so a loose limit makes this a free Gumroad key checker. Overridable for
+// test.sh and for self-hosted boxes, where every client shares one bucket.
+const activationsPerHourPerIP = (env) => Number(env.ACTIVATIONS_PER_HOUR_PER_IP ?? 20) || 20;
 
 /// True if this request is within the limit, false if it should be refused.
 ///
@@ -532,7 +548,7 @@ async function refusal(request, env, ctx) {
 async function activateDevice(request, env) {
   let body;
   try {
-    body = await request.json();
+    body = objectBody(await request.json());
   } catch {
     return fail(400, "bad_request");
   }
@@ -697,6 +713,10 @@ async function activateDevice(request, env) {
 
   // COALESCE, not overwrite: a later verify that omits the sale id mustn't erase ours.
   //
+  // A NULL on a row that isn't active doesn't count: the revoked INSERT writes one because it has
+  // no horizon to give, and pinning it would grandfather forever a membership first seen while
+  // refunded or disputed, once the refund is reversed.
+  //
   // `entitled_until` is monotonic both ways: NULL never becomes a horizon, and a horizon never
   // becomes NULL. Only horizon -> horizon moves, which is a renewal.
   //
@@ -718,7 +738,7 @@ async function activateDevice(request, env) {
     "checked_at = excluded.checked_at, " +
     "gumroad_sale_id = COALESCE(excluded.gumroad_sale_id, licenses.gumroad_sale_id), " +
     "entitled_until = CASE " +
-    "WHEN licenses.entitled_until IS NULL THEN NULL " +
+    "WHEN licenses.entitled_until IS NULL AND licenses.status = 'active' THEN NULL " +
     "WHEN excluded.entitled_until IS NULL THEN licenses.entitled_until " +
     "ELSE excluded.entitled_until END"
   ).bind(hash, stamp, stamp, saleID, source, entitledUntil).run();
@@ -817,7 +837,7 @@ async function createFile(request, env, auth) {
 
   let body;
   try {
-    body = await request.json();
+    body = objectBody(await request.json());
   } catch {
     return fail(400, "bad_request");
   }
@@ -832,10 +852,17 @@ async function createFile(request, env, auth) {
   const contentType = String(body.content_type ?? "").toLowerCase().split(";")[0].trim();
   if (!TYPE_RE.test(contentType)) return fail(400, "bad_type");
 
+  // Per sale, not per hash: an App Store account redeeming a website membership gets its own
+  // hash, and without this every account on one sale would get a full quota.
+  const scope =
+    "license_hash IN (SELECT license_hash FROM licenses WHERE license_hash = ? OR " +
+    "(gumroad_sale_id IS NOT NULL AND gumroad_sale_id = " +
+    "(SELECT gumroad_sale_id FROM licenses WHERE license_hash = ?))) " +
+    "AND state IN ('pending','ready') AND expires_at > ?";
+  const hash = auth.license.license_hash;
   const used = await env.DB.prepare(
-    "SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes FROM files " +
-    "WHERE license_hash = ? AND state IN ('pending','ready') AND expires_at > ?"
-  ).bind(auth.license.license_hash, now()).first();
+    `SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes FROM files WHERE ${scope}`
+  ).bind(hash, hash, now()).first();
 
   if (used.n >= MAX_ACTIVE_FILES_PER_LICENSE) {
     return fail(409, "quota_files", { max_files: MAX_ACTIVE_FILES_PER_LICENSE });
@@ -849,11 +876,20 @@ async function createFile(request, env, auth) {
   const stamp = now();
   const expires = stamp + TTL_SECONDS;
 
-  await env.DB.prepare(
+  // The check above is for the error code; this is the enforcement. One statement, so parallel
+  // creates can't all read the same usage and all insert: whichever lands past the cap inserts
+  // nothing.
+  const inserted = await env.DB.prepare(
     "INSERT INTO files (id, license_hash, device_id, token, name, size, content_type, state, created_at, expires_at) " +
-    "VALUES (?,?,?,?,?,?,?,'pending',?,?)"
-  ).bind(id, auth.license.license_hash, auth.device.id, token,
-         sanitizeName(body.name), size, contentType, stamp, expires).run();
+    "SELECT ?,?,?,?,?,?,?,'pending',?,? " +
+    `WHERE (SELECT COUNT(*) FROM files WHERE ${scope}) < ? ` +
+    `AND (SELECT COALESCE(SUM(size), 0) FROM files WHERE ${scope}) + ? <= ?`
+  ).bind(id, hash, auth.device.id, token, sanitizeName(body.name), size, contentType, stamp, expires,
+         hash, hash, stamp, MAX_ACTIVE_FILES_PER_LICENSE,
+         hash, hash, stamp, size, MAX_ACTIVE_BYTES_PER_LICENSE).run();
+  if (!inserted.meta?.changes) {
+    return fail(409, "quota_bytes", { max_total_bytes: MAX_ACTIVE_BYTES_PER_LICENSE });
+  }
 
   return reply(201, {
     id,
@@ -1313,6 +1349,13 @@ async function abuseReport(request, env, ctx) {
   const origin = request.headers.get("origin") ?? "";
   if (!reportOrigins(env).includes(origin)) return reportReply(403, { code: "bad_origin" }, origin, env);
 
+  // Before formData(), which buffers the whole body, and before Turnstile: Origin is a header
+  // anyone can set, so without this one script could make the isolate hold ~100 MB per request.
+  const declared = Number(request.headers.get("content-length"));
+  if (!Number.isInteger(declared) || declared <= 0 || declared > MAX_REPORT_BYTES) {
+    return reportReply(413, { code: "too_big" }, origin, env);
+  }
+
   let form;
   try {
     form = await request.formData();
@@ -1327,8 +1370,16 @@ async function abuseReport(request, env, ctx) {
     return reportReply(403, { code: "bot_check", message: "Bot check failed, please reload and try again." }, origin, env);
   }
 
-  const shareURL = String(form.get("share_url") ?? "").trim();
-  const match = shareURL.match(/^https:\/\/files\.getmushroom\.app\/f\/([A-Za-z0-9_-]{22})$/);
+  // Parsed, not matched whole: every link the app hands out ends in `#key`, the file's
+  // decryption key. That's dropped here and never reaches the email or the database.
+  let shareURL = "";
+  let match = null;
+  try {
+    const link = new URL(String(form.get("share_url") ?? "").trim());
+    match = link.origin === "https://files.getmushroom.app"
+      ? link.pathname.match(/^\/f\/([A-Za-z0-9_-]{22})$/) : null;
+    shareURL = `${link.origin}${link.pathname}`;
+  } catch { /* not a URL; match stays null */ }
   if (!match) {
     return reportReply(400, { code: "bad_url", message: "That does not look like a Mushroom share link." }, origin, env);
   }
@@ -1336,8 +1387,10 @@ async function abuseReport(request, env, ctx) {
   const reason = String(form.get("reason") ?? "");
   if (!REPORT_REASONS.includes(reason)) return reportReply(400, { code: "bad_reason" }, origin, env);
 
-  const name = String(form.get("name") ?? "").trim().slice(0, MAX_REPORTER_NAME_CHARS);
-  const email = String(form.get("email") ?? "").trim().slice(0, MAX_REPORTER_EMAIL_CHARS);
+  // One line each: they're printed beside the server's own fields in the email.
+  const oneLine = (v) => String(v ?? "").replace(/[\r\n\t]+/g, " ").trim();
+  const name = oneLine(form.get("name")).slice(0, MAX_REPORTER_NAME_CHARS);
+  const email = oneLine(form.get("email")).slice(0, MAX_REPORTER_EMAIL_CHARS);
   const details = String(form.get("details") ?? "").trim().slice(0, MAX_DETAILS_CHARS);
   if (!name || !email.includes("@")) {
     return reportReply(400, { code: "bad_contact", message: "Please give a name and an email we can reply to." }, origin, env);
@@ -1404,14 +1457,14 @@ async function notifyOwner(env, r) {
   const expires = new Date(r.file.expires_at * 1000).toISOString();
   const shortFile = r.file.id.slice(0, 8);
 
+  // Ours first, theirs last and quoted. The reporter writes `details` (and name and email), and
+  // free text above the commands could carry a convincing fake "File id" or curl block naming
+  // someone else's licence. Every line of theirs starts with "> ", so nothing they write can
+  // pass for ours.
+  const quoted = (text) => String(text ?? "").split(/\r?\n/).map((line) => `> ${line}`).join("\n");
   const lines = [
     `Reason:    ${r.reason}`,
     `Reported:  ${when}`,
-    `Reporter:  ${r.name} <${r.email}>`,
-    ``,
-    `Details:`,
-    r.details || "(none given)",
-    ``,
     `Reported link (do not click, shown as text):`,
     `  ${r.shareURL}`,
     ``,
@@ -1428,6 +1481,11 @@ async function notifyOwner(env, r) {
     `Report id: ${r.id}`,
     ``,
     adminCommands(env, r.file),
+    ``,
+    `---- Written by the reporter, unverified ----`,
+    quoted(`${r.name} <${r.email}>`),
+    quoted(""),
+    quoted(r.details || "(no details given)"),
   ];
   const text = lines.join("\n");
 
@@ -1474,7 +1532,7 @@ async function purgeFile(env, id) {
 
 async function adminDeleteFile(request, env) {
   let body;
-  try { body = await request.json(); } catch { return fail(400, "bad_request"); }
+  try { body = objectBody(await request.json()); } catch { return fail(400, "bad_request"); }
   const id = String(body.file_id ?? "");
   if (!id) return fail(400, "bad_request");
 
@@ -1489,7 +1547,7 @@ async function adminDeleteFile(request, env) {
 /// purchase is a separate act in Gumroad, using the sale id in the report email.
 async function adminBlockLicense(request, env) {
   let body;
-  try { body = await request.json(); } catch { return fail(400, "bad_request"); }
+  try { body = objectBody(await request.json()); } catch { return fail(400, "bad_request"); }
   const hash = String(body.license_hash ?? "");
   if (!hash) return fail(400, "bad_request");
 
@@ -1555,7 +1613,12 @@ async function sweep(env) {
       "SELECT id, name, size, content_type, state, device_id, license_hash, created_at, expires_at " +
       "FROM files WHERE id = ?"
     ).bind(report.file_id).first();
-    if (!file) continue;
+    // The file row is gone (rows outlive files by days, reports by months). Mark it, or it's
+    // selected again every hour and holds a batch slot from every newer failure forever.
+    if (!file) {
+      await env.DB.prepare("UPDATE abuse_reports SET notified = 'orphaned' WHERE id = ?").bind(report.id).run();
+      continue;
+    }
     const license = await env.DB.prepare(
       "SELECT gumroad_sale_id FROM licenses WHERE license_hash = ?"
     ).bind(file.license_hash).first();
@@ -1615,9 +1678,9 @@ export default {
       //
       // Self-hosted, nothing sets or strips cf-connecting-ip, so a client could pick a fresh
       // bucket per request. One bucket for the box instead.
-      const ip = env.SELFHOST === "1" ? "box" : (request.headers.get("cf-connecting-ip") ?? "unknown");
-      if (!(await throttle(env, "activate", ip, activationsPerMinutePerIP(env), 60))) {
-        return fail(429, "rate_limited", { retry_after: 60 });
+      const ip = env.SELFHOST === "1" ? "box" : clientBucket(request.headers.get("cf-connecting-ip"));
+      if (!(await throttle(env, "activate", ip, activationsPerHourPerIP(env), 3600))) {
+        return fail(429, "rate_limited", { retry_after: 600 });
       }
       return activateDevice(request, env);
     }

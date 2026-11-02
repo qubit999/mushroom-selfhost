@@ -47,6 +47,9 @@ const MAX_MSG_ID_CHARS = 64;
 const SENT_AT_PAST_SECONDS = 86400;
 const SENT_AT_FUTURE_SECONDS = 300;
 const RETENTION_SECONDS = 30 * 24 * 60 * 60;    // then the sweep drops it
+// Stored ciphertext per sender, a few thousand full-length messages. Generous for a person,
+// and the whole friend list at this size still fits a Durable Object.
+const MAX_STORED_CHARS_PER_PEER = 64 * 1024 * 1024;
 const INVITE_TTL_SECONDS = 24 * 60 * 60;
 const INVITES_PER_DAY = 20;
 const MESSAGES_PER_MINUTE = 60;
@@ -61,6 +64,7 @@ const SYNC_PAGE = 200;
 // hour would hit 429; `wrangler dev --var` raises it locally, production keeps the default.
 const activationsPerHourPerIP = (env) => Number(env.ACTIVATIONS_PER_HOUR_PER_IP ?? 10) || 10;
 const ACCEPTS_PER_HOUR = 30;
+const LINKS_PER_HOUR = 10;
 
 // How long after delivering on a socket we wait for the ack before pushing. An awake Mac always
 // beats it, and a notification still feels immediate.
@@ -94,6 +98,9 @@ const MAX_PRESENCE_FANOUT = 50;
 // device (seat eviction, "Start Over"), a blocked license or a refund never touched an open
 // connection; the client only reconnects on error. One D1 read per socket per five minutes.
 const SOCKET_RECHECK_SECONDS = 300;
+// Connect and close each fan out to every friend. A reconnecting Mac needs a handful a minute; a
+// connect loop would otherwise wake every friend's inbox per cycle, without limit.
+const PRESENCE_ANNOUNCES_PER_MINUTE = 12;
 
 const INVITE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";  // no I, L, O, U; matches Messaging.inviteAlphabet
 const INVITE_CODE_LENGTH = 8;
@@ -181,6 +188,13 @@ async function throttle(env, key, bucket, limit, windowSeconds) {
   const response = await inboxCall(env, `rate:${key}`, "/rate",
                                    { bucket, limit, window: windowSeconds });
   return response.ok;
+}
+
+/// A JSON body that is an object, or a throw the caller's catch turns into 400. `null`, a number
+/// or an array parse fine, and the next `body.x` would be an uncaught 500.
+function objectBody(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  throw new TypeError("body is not an object");
 }
 
 // ---------------------------------------------------------------- license
@@ -278,6 +292,7 @@ async function verifyLicenseAgainst(key, productID, env) {
 import { APPSTORE_BUNDLE_ID, APPLE_ROOT_CA_G3, APPLE_ROOT_CA_G2 } from "../worker-shared/apple-roots.js";
 // The entitlement rules are shared for the same reason: the workers gate different features on
 // one membership, so a rule that differs between them keeps one feature and drops the other.
+import { clientBucket } from "../worker-shared/client-bucket.js";
 import { LICENSE_RECHECK_SECONDS, appStoreEntitlement, verifyAppSubscription,
          entitlementMisconfigured,
          SETAPP_RECHECK_SECONDS, setappMisconfigured, verifySetappAccess }
@@ -434,13 +449,17 @@ async function verifyAppTransaction(jws, env) {
   }
 
   const failures = [];
-  for (const verifier of verifiers) {
+  for (const [index, verifier] of verifiers.entries()) {
     try {
       const tx = await verifier.verifyAndDecodeAppTransaction(jws);
       // The verifier already checked bundleId. `appTransactionId` is what we need and it's
       // optional in the model; without it there's no identity.
       if (typeof tx.appTransactionId === "string" && tx.appTransactionId) {
-        const bought = typeof tx.originalPurchaseDate === "number" ? tx.originalPurchaseDate : null;
+        // A sandbox AppTransaction (verifier 1) is never grandfathered: TestFlight hands them out
+        // free, and one dated before the cutover would otherwise be a lifetime entitlement.
+        // App Review is unaffected; it already buys after the cutover.
+        const bought = index > 0 ? Date.now()
+          : typeof tx.originalPurchaseDate === "number" ? tx.originalPurchaseDate : null;
         return verdict("active", tx.appTransactionId, bought);
       }
       failures.push("no_app_transaction_id");
@@ -619,7 +638,7 @@ async function refusal(token, env, ctx) {
 async function activateDevice(request, env) {
   let body;
   try {
-    body = await request.json();
+    body = objectBody(await request.json());
   } catch {
     return fail(400, "bad_request");
   }
@@ -832,6 +851,10 @@ async function activateDevice(request, env) {
   // `entitled_until` is monotonic both ways: NULL never becomes a horizon, and a horizon never
   // becomes NULL. Only horizon -> horizon moves, which is a renewal.
   //
+  // One exception: a NULL on a row that isn't active. The revoked INSERT writes NULL because it
+  // has no horizon to give, and pinning that would grandfather forever a membership first seen
+  // while refunded or disputed, once the refund is reversed.
+  //
   // Horizon -> NULL would make a config slip irreversible: `appStoreEntitlement()` answers NULL
   // when ENTITLEMENT_CUTOVER is absent, 0 or unparseable, and `wrangler deploy` replaces `vars`
   // wholesale, so one deploy missing the var (it ships commented out) would make every subscriber
@@ -855,7 +878,7 @@ async function activateDevice(request, env) {
       "checked_at = excluded.checked_at, " +
       "gumroad_sale_id = COALESCE(excluded.gumroad_sale_id, licenses.gumroad_sale_id), " +
       "entitled_until = CASE " +
-      "WHEN licenses.entitled_until IS NULL THEN NULL " +
+      "WHEN licenses.entitled_until IS NULL AND licenses.status = 'active' THEN NULL " +
       "WHEN excluded.entitled_until IS NULL THEN licenses.entitled_until " +
       "ELSE excluded.entitled_until END"
     ).bind(hash, stamp, stamp, saleID, source, entitledUntil).run();
@@ -875,6 +898,14 @@ async function activateDevice(request, env) {
   // messages). Binding the identity to the first license that claimed it costs one lookup.
   const claimed = await env.DB.prepare("SELECT license_hash FROM identities WHERE id = ?")
     .bind(identityID).first();
+  // No row, but an inbox with friends or messages: an identity whose row migration 0004 deleted
+  // (pre-0002, every device swept). Its owner can't be told from a former friend holding the
+  // public key, so nobody gets it; the owner's way back is Start Over, a new identity.
+  if (!claimed) {
+    const response = await inboxCall(env, identityID, "/occupied", {}).catch(() => null);
+    if (!response?.ok) return fail(503, "try_again");
+    if ((await response.json()).occupied) return fail(403, "identity_claimed");
+  }
   if (claimed && claimed.license_hash && claimed.license_hash !== hash) {
     // Before refusing: someone switching between the direct download and the App Store arrives
     // with a good credential on a Mac whose identity is bound to the other channel's hash. If
@@ -896,6 +927,11 @@ async function activateDevice(request, env) {
     "INSERT INTO identities (id, public_key, license_hash, created_at) VALUES (?, ?, ?, ?) " +
     "ON CONFLICT(id) DO UPDATE SET license_hash = COALESCE(identities.license_hash, excluded.license_hash)"
   ).bind(identityID, body.public_key, hash, stamp).run();
+  // The check above is a read before this write, so two first claims racing under different
+  // licences both pass it. The COALESCE keeps the winner; the loser stops here, before a device.
+  const owner = await env.DB.prepare("SELECT license_hash FROM identities WHERE id = ?")
+    .bind(identityID).first();
+  if (owner?.license_hash !== hash) return fail(403, "identity_claimed");
 
   // This Mac's previous row goes first, making a re-activation a reclaim, not a second seat. The
   // client sends the device id it holds; otherwise its stale row looks like another Mac's, the
@@ -996,7 +1032,7 @@ async function listDevices(env, auth) {
 async function revokeDevice(request, env, auth) {
   let body;
   try {
-    body = await request.json();
+    body = objectBody(await request.json());
   } catch {
     return fail(400, "bad_json");
   }
@@ -1032,6 +1068,11 @@ async function revokeDevice(request, env, auth) {
 /// No rate limit beyond the general gate: minting is cheap, codes die fast, and someone who
 /// scans badly and taps again shouldn't be told to wait.
 async function createLink(env, auth) {
+  // Each code is a live credential and a D1 row until the daily sweep, so a loop would mint
+  // both without bound. A person pairs a phone a few times a year.
+  if (!(await throttle(env, auth.identityID, "link", LINKS_PER_HOUR, 3600))) {
+    return fail(429, "rate_limited", { retry_after: 3600 });
+  }
   const stamp = now();
   // Same entropy as a device token: it's a bearer credential while it lives.
   const code = randomToken();
@@ -1070,7 +1111,7 @@ async function createInvite(env, auth) {
 async function acceptInvite(request, env, auth) {
   let body;
   try {
-    body = await request.json();
+    body = objectBody(await request.json());
   } catch {
     return fail(400, "bad_request");
   }
@@ -1158,7 +1199,7 @@ async function friendAction(env, auth, peerID, action) {
 const registerPush = async (request, env, auth) => {
   let body;
   try {
-    body = await request.json();
+    body = objectBody(await request.json());
   } catch {
     return fail(400, "bad_request");
   }
@@ -1361,9 +1402,12 @@ export class UserInbox {
   /// Every live socket, or only those belonging to one device.
   sockets() { return this.ctx.getWebSockets(); }
 
-  send(frame) {
+  async send(frame) {
     const text = JSON.stringify(frame);
     for (const socket of this.sockets()) {
+      // Outbound too. A client that never sends a frame never meets the inbound check, and would
+      // keep receiving after its device is revoked or its licence blocked or lapsed.
+      if (!(await this.stillAuthorized(socket))) continue;
       try {
         socket.send(text);
       } catch {
@@ -1386,7 +1430,7 @@ export class UserInbox {
 
     let body = {};
     try {
-      body = await request.json();
+      body = objectBody(await request.json());
     } catch { /* the internal callers below all tolerate an empty body */ }
 
     switch (path) {
@@ -1405,6 +1449,10 @@ export class UserInbox {
       // and a stale row's `last_acked_seq` can never advance (acks are keyed on the live
       // socket's device id), so it would push every message to a Mac that's acking normally.
       case "/devices/remove": return this.removeDevice(body.device);
+      case "/occupied": return reply(200, {
+        occupied: !!(this.one("SELECT 1 AS x FROM friends LIMIT 1")
+                     || this.one("SELECT 1 AS x FROM messages LIMIT 1")),
+      });
       // Counter only, for `throttle` on routes with no inbox; touches nothing else here.
       case "/rate":
         return (await this.allow(body.bucket, body.limit, body.window))
@@ -1413,7 +1461,7 @@ export class UserInbox {
     }
   }
 
-  addFriend({ peer, public_key: publicKey }) {
+  async addFriend({ peer, public_key: publicKey }) {
     if (!peer || !publicKey) return fail(400, "bad_request");
     const count = this.one("SELECT COUNT(*) AS n FROM friends WHERE blocked = 0");
     if ((count?.n ?? 0) >= MAX_FRIENDS && !this.friend(peer)) {
@@ -1427,7 +1475,7 @@ export class UserInbox {
     // Tell this Mac about a friendship it didn't ask for. The accepter learns from the HTTP
     // reply; without this frame the code's creator learns nothing and drops every message from
     // the unknown friend. `/friends/list` covers the offline case; this covers the live one.
-    this.send({ t: "friend_added", peer_id: peer, public_key: publicKey });
+    await this.send({ t: "friend_added", peer_id: peer, public_key: publicKey });
     return reply(200, {});
   }
 
@@ -1494,6 +1542,12 @@ export class UserInbox {
     if (!mine && friend.blocked) return fail(403, "blocked");
 
     const stamp = now();
+    // A ceiling per sender on what sits here. The send rate alone lets one friend store ~1.8 GB
+    // a day for 30 days, past the object's storage limit, and then nobody's messages land.
+    const held = this.one("SELECT COALESCE(SUM(length(ciphertext)), 0) AS n FROM messages WHERE peer = ?", from);
+    if ((held?.n ?? 0) + String(ciphertext).length > MAX_STORED_CHARS_PER_PEER) {
+      return fail(507, "inbox_full");
+    }
     // Retention runs here, not on a cron: Durable Objects can't be listed, so a cron couldn't
     // reach them. On the write path, "we keep messages 30 days" is structurally true. Indexed,
     // and bounded by this same delete, so it stays cheap.
@@ -1516,7 +1570,7 @@ export class UserInbox {
     const row = this.one("SELECT seq FROM messages WHERE msg_id = ?", msgID);
     if (!row) return fail(500, "not_stored");
 
-    this.send({
+    await this.send({
       t: "message",
       message: { msg_id: msgID, peer_id: from, ciphertext, sent_at: sent, seq: row.seq },
     });
@@ -1564,13 +1618,13 @@ export class UserInbox {
     // Symmetric: Settings promises "with it off, you will not see theirs either", so hiding
     // your presence also hides friends' typing dots and online state.
     if (!(await this.sharePresence())) return reply(200, {});
-    this.send({ t: "typing", peer_id: from });
+    await this.send({ t: "typing", peer_id: from });
     return reply(200, {});
   }
 
   /// Lands on the sender's inbox: their message reached the other Mac's disk.
-  markDelivered({ ids }) {
-    for (const id of ids ?? []) this.send({ t: "delivered", msg_id: id });
+  async markDelivered({ ids }) {
+    for (const id of Array.isArray(ids) ? ids : []) await this.send({ t: "delivered", msg_id: id });
     return reply(200, {});
   }
 
@@ -1591,7 +1645,7 @@ export class UserInbox {
                   online ? now() : null, peer);
     const sharing = await this.sharePresence();
     if (sharing && this.sockets().length) {
-      this.send({ t: "presence", peer_id: peer, online: !!online });
+      await this.send({ t: "presence", peer_id: peer, online: !!online });
     }
 
     if (replyTo && this.sockets().length && sharing) {
@@ -1649,7 +1703,9 @@ export class UserInbox {
     // socket stays open.
     this.ctx.acceptWebSocket(pair[1], [deviceID]);
 
-    if (wasOffline) await this.announcePresence(true);
+    if (wasOffline && (await this.allow("presence", PRESENCE_ANNOUNCES_PER_MINUTE, 60))) {
+      await this.announcePresence(true);
+    }
     // Deferred: the client can't receive anything until it has the socket.
     this.ctx.waitUntil(this.sendSnapshot(pair[1]));
     return new Response(null, { status: 101, webSocket: pair[0] });
@@ -1667,6 +1723,8 @@ export class UserInbox {
     } catch {
       return;   // Never close the socket over one genuinely bad frame.
     }
+    // Same rule for valid JSON that isn't a frame: `null` would throw on `.t` below.
+    if (!frame || typeof frame !== "object") return;
 
     // `stillAuthorized` guards every frame that does something, not just the heartbeat, or a
     // lapsed, revoked or blocked client that stops pinging keeps sending, acking and typing
@@ -1704,7 +1762,7 @@ export class UserInbox {
     // send rate and fill a friend's Durable Object until writes fail, and then that person
     // stops receiving from everyone.
     if (typeof msgID !== "string" || !msgID || msgID.length > MAX_MSG_ID_CHARS
-        || !peerID || !isBase64(ciphertext, MAX_CIPHERTEXT_CHARS)) {
+        || typeof peerID !== "string" || !peerID || !isBase64(ciphertext, MAX_CIPHERTEXT_CHARS)) {
       return socket.send(JSON.stringify({
         t: "rejected", msg_id: typeof msgID === "string" ? msgID.slice(0, MAX_MSG_ID_CHARS) : "",
         code: "bad_request",
@@ -1870,7 +1928,10 @@ export class UserInbox {
     // (`connect()` opens the new socket immediately). Counting gets it wrong one way or the
     // other, and announcing offline while the replacement is live leaves the Mac offline to
     // every friend for the session. Excluding it explicitly is right either way.
-    if (this.sockets().every((s) => s === socket)) await this.announcePresence(false);
+    if (this.sockets().every((s) => s === socket)
+        && (await this.allow("presence", PRESENCE_ANNOUNCES_PER_MINUTE, 60))) {
+      await this.announcePresence(false);
+    }
   }
 
   async webSocketError(socket) { return this.webSocketClose(socket); }
@@ -2086,11 +2147,12 @@ function adminOK(request, env) {
 /// control for the App Store channel, whose refunds are invisible here; the alternative is
 /// hand-typed SQL in production with no audit line and no device revocation.
 ///
-/// Live sockets aren't closed here: `stillAuthorized` drops each within
-/// SOCKET_RECHECK_SECONDS, with no fan-out across inboxes.
+/// Each device is also removed from its inbox, which closes its live sockets now. Waiting for
+/// `stillAuthorized` isn't enough: a client that sends nothing keeps receiving until the
+/// next frame goes out to it.
 async function adminBlockLicense(request, env) {
   let body;
-  try { body = await request.json(); } catch { return fail(400, "bad_request"); }
+  try { body = objectBody(await request.json()); } catch { return fail(400, "bad_request"); }
   const hash = String(body.license_hash ?? "");
   if (!hash) return fail(400, "bad_request");
 
@@ -2099,8 +2161,11 @@ async function adminBlockLicense(request, env) {
 
   await env.DB.prepare("UPDATE licenses SET status = 'blocked' WHERE license_hash = ?").bind(hash).run();
   const devices = await env.DB.prepare(
-    "UPDATE devices SET revoked_at = ? WHERE license_hash = ? AND revoked_at IS NULL RETURNING id"
+    "UPDATE devices SET revoked_at = ? WHERE license_hash = ? AND revoked_at IS NULL RETURNING id, identity_id"
   ).bind(now(), hash).all();
+  for (const device of devices.results ?? []) {
+    await inboxCall(env, device.identity_id, "/devices/remove", { device: device.id }).catch(() => {});
+  }
 
   const count = (devices.results ?? []).length;
   console.log(`admin blocked license devices=${count}`);
@@ -2128,24 +2193,24 @@ export default {
       // Self-hosted, nothing sets or strips cf-connecting-ip, so trusting it lets a client pick
       // a fresh bucket per request, and each bucket is a durable object on disk forever. One
       // bucket for the box; config.capnp.example sizes it.
-      const ip = env.SELFHOST === "1" ? "box" : (request.headers.get("cf-connecting-ip") ?? "unknown");
+      const ip = env.SELFHOST === "1" ? "box" : clientBucket(request.headers.get("cf-connecting-ip"));
       if (!(await throttle(env, ip, "activate", activationsPerHourPerIP(env), 3600))) {
         return fail(429, "rate_limited", { retry_after: 600 });
       }
       return activateDevice(request, env);
     }
 
-    // The socket. Header first; the query string is only a fallback for older clients.
+    // The socket. Header only: every client build sends it there.
     //
-    // A URL token is safe on the wire but not in our logs: with `observability` on,
-    // Cloudflare records the URL verbatim in Workers Logs, putting a live, non-expiring device
-    // token in a searchable index any read-only dashboard account or leaked API token can
-    // page through. Headers aren't captured that way, and `URLSessionWebSocketTask` built from
-    // a `URLRequest` does send the Authorization header in the handshake.
+    // Never the query string. With `observability` on, Cloudflare records the URL verbatim in
+    // Workers Logs, so a URL token puts a live, non-expiring device token in a searchable index
+    // any read-only dashboard account or leaked API token can page through. Headers aren't
+    // captured that way, and `URLSessionWebSocketTask` built from a `URLRequest` does send the
+    // Authorization header in the handshake.
     if (path === "/v1/connect") {
       const header = request.headers.get("authorization") ?? "";
       const bearer = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
-      const socketToken = bearer || (url.searchParams.get("token") ?? "");
+      const socketToken = bearer;
       const auth = await authenticateToken(socketToken, env, ctx);
       if (!auth) return refusal(socketToken, env, ctx);
       const target = new URL("https://inbox/connect");

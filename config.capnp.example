@@ -128,9 +128,9 @@ const files :Workerd.Worker = (
     (name = "SQL", durableObjectNamespace = "SqlStore"),
     (name = "BLOBS", service = "blobs"),
 
-    # One activation bucket for the box, as on messaging. Higher than hosted's 30 because every
-    # Mac shares it, including the routine re-activations.
-    (name = "ACTIVATIONS_PER_MINUTE_PER_IP", text = "300"),
+    # One activation bucket for the box, as on messaging, and the same size: every Mac shares it,
+    # including the routine re-activations.
+    (name = "ACTIVATIONS_PER_HOUR_PER_IP", text = "1000"),
 
     # CHANGE ME, and get it right: it's in every share link, so a wrong value sends people
     # somewhere else for files that live here. Include the port if files use one (which is why

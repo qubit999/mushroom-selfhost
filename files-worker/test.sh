@@ -2,7 +2,11 @@
 # Smoke matrix for mushroom-files against a running `wrangler dev`.
 #
 #   Terminal 1:  npx wrangler d1 migrations apply mushroom-files --local
-#                npx wrangler dev --persist-to ../.wrangler-dev-state
+#                npx wrangler dev --persist-to ../.wrangler-dev-state \
+#                  --var ACTIVATIONS_PER_HOUR_PER_IP:1000
+#
+# The --var is required, as for mushroom-messaging: the default is 20 activations an hour, and a
+# second run within the hour would hit 429.
 #   Terminal 2:  ./test.sh
 #
 # By default this seeds a licence and a device straight into the local D1, so it runs with no
@@ -127,6 +131,8 @@ want "create with a malformed content_type is 400" 400 \
 want "create with a newline in content_type is 400" 400 \
   "$(status -X POST "${AUTH[@]}" -H 'content-type: application/json' \
      -d '{"name":"x.bin","size":10,"content_type":"application/x\nType: forged"}' "$BASE/v1/files")"
+want "create with a JSON null body is 400, not 500" 400 \
+  "$(status -X POST "${AUTH[@]}" -H 'content-type: application/json' -d 'null' "$BASE/v1/files")"
 want "create over the size cap is 413" 413 \
   "$(status -X POST "${AUTH[@]}" -H 'content-type: application/json' \
      -d '{"name":"big.pdf","size":999999999,"content_type":"application/pdf"}' "$BASE/v1/files")"
@@ -303,6 +309,12 @@ want "report with no turnstile token is 403" 403 \
   "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$ORIGIN" \
      -F "share_url=$SHARE" -F reason=malware -F name=x -F email=x@y.z "$REPORT")"
 want "report with a junk share url is 400" 400 "$(report 'https://example.com/f/nope')"
+# Every link the app hands out ends in #key; the form must take it as pasted. An unissued token,
+# so no row lands on $SHARE's file and the counts below stay exact: 200 here (not 400) is the parse.
+want "report of a link with its #key is accepted" 200 \
+  "$(report "https://files.getmushroom.app/f/BBBBBBBBBBBBBBBBBBBBBB#c2VjcmV0LWtleQ")"
+want "an oversized report is refused before parsing" 413 \
+  "$(report "$SHARE" malware Reporter r@example.com "$(head -c 20000 /dev/zero | tr '\0' x)")"
 want "report with a bad reason is 400"     400 "$(report "$SHARE" nonsense)"
 want "report with no name is 400"          400 "$(report "$SHARE" malware "")"
 want "report with no email is 400"         400 "$(report "$SHARE" malware Reporter "")"

@@ -7,7 +7,7 @@
 const BASE = process.env.BASE ?? "http://localhost:8799";
 const [aliceToken, bobID] = process.argv.slice(2);
 
-const socket = new WebSocket(`${BASE.replace(/^http/, "ws")}/v1/connect?token=${aliceToken}`);
+const socket = new WebSocket(`${BASE.replace(/^http/, "ws")}/v1/connect`, { headers: { authorization: `Bearer ${aliceToken}` } });
 await new Promise((resolve, reject) => {
   socket.addEventListener("open", resolve, { once: true });
   socket.addEventListener("error", reject, { once: true });

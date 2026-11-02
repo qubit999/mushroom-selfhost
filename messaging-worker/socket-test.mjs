@@ -22,9 +22,9 @@ const want = (label, expected, actual) =>
 /// A socket plus a queue, so a test can await the next frame of a type without racing whatever
 /// the server sent first (usually a presence snapshot).
 function connect(token, { presence = true } = {}) {
-  const url = `${BASE.replace(/^http/, "ws")}/v1/connect?token=${token}` +
-              (presence ? "" : "&presence=0");
-  const socket = new WebSocket(url);
+  // The token in the header, as the app sends it; the server refuses it in the URL.
+  const url = `${BASE.replace(/^http/, "ws")}/v1/connect` + (presence ? "" : "?presence=0");
+  const socket = new WebSocket(url, { headers: { authorization: `Bearer ${token}` } });
   // next() consumes pending frames, so a second `next("accepted")` waits for a new one rather
   // than returning the first again; otherwise later assertions pass against stale frames.
   const pending = [];

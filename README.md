@@ -252,8 +252,8 @@ link opens: that exercises the other server and confirms `PUBLIC_BASE`.
 - **Share links point at the wrong place.** `PUBLIC_BASE` is wrong. Fix `.env` and run
   `docker compose up -d`. Links already handed out keep the old address.
 - **Activations start failing after a burst.** The box has no way to tell clients apart behind
-  your proxy, so the rate limit is one bucket for everyone: `ACTIVATIONS_PER_HOUR_PER_IP` on
-  friends, `ACTIVATIONS_PER_MINUTE_PER_IP` on file sharing, both in `config.capnp.example`.
+  your proxy, so the rate limit is one bucket for everyone: `ACTIVATIONS_PER_HOUR_PER_IP`, set
+  for each server in `config.capnp.example`.
   Wait for the window to pass.
 
 ## Without Docker
