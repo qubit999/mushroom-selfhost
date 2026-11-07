@@ -41,12 +41,6 @@ const MAX_DEVICE_NAME_CHARS = 60;
 // A UUID is 36. The id is stored and rebroadcast, so unbounded it's a way past the ciphertext
 // cap into a friend's storage quota (see `handleSend`).
 const MAX_MSG_ID_CHARS = 64;
-// How far `sent_at` may sit from the server clock. The sender picks it and the AEAD binding
-// doesn't cover it, and it's the sort key on the other side, so a sender's wrong clock (a fresh
-// Windows install with the zone left on US time and the hour fixed by hand runs hours off)
-// reordered the conversation. A message written offline is dated when it reached us instead.
-const SENT_AT_PAST_SECONDS = 60;
-const SENT_AT_FUTURE_SECONDS = 60;
 // Our clock at the moment a message frame leaves, so the receiver can move `sent_at` onto its
 // own clock (`Messaging.localTime`). Fractional: whole seconds tie a quick exchange.
 const serverNow = () => Date.now() / 1000;
@@ -1534,7 +1528,7 @@ export class UserInbox {
   }
 
   /// Store a message sent to us, and get it in front of the user.
-  async deliver({ msg_id: msgID, from, ciphertext, sent_at: sentAt }) {
+  async deliver({ msg_id: msgID, from, ciphertext }) {
     if (!msgID || !from || !ciphertext) return fail(400, "bad_request");
 
     // The same self exception as `handleSend`, which calls this: writing to our own inbox is how
@@ -1556,15 +1550,12 @@ export class UserInbox {
     // reach them. On the write path, "we keep messages 30 days" is structurally true. Indexed,
     // and bounded by this same delete, so it stays cheap.
     this.sql.exec("DELETE FROM messages WHERE created_at < ?", stamp - RETENTION_SECONDS);
-    // Clamped around our clock, once for both the row and the frame. The sender picks it and
-    // `MessageCrypto.binding` covers only `msgID|senderID`, yet it's the sole sort key on the
-    // other side (`Messaging.ordered`, `conversationOrder`). Unclamped, a message dated 2100
-    // pins its conversation to the top forever, and one dated far back sinks below the
-    // 500-row read window: stored, counted unread, never visible.
-    const claimed = Number(sentAt);
-    const sent = Number.isFinite(claimed)
-      ? Math.min(Math.max(claimed, stamp - SENT_AT_PAST_SECONDS), stamp + SENT_AT_FUTURE_SECONDS)
-      : stamp;
+    // Our clock, not the sender's: `sent_at` is the sole sort key on the other side
+    // (`Messaging.ordered`, `conversationOrder`) and a client's clock can be anything. Even a
+    // minute slow put a reply above the message it answered. The sender's claim isn't covered
+    // by `MessageCrypto.binding` either, so trusting it let a modified client reorder someone
+    // else's conversation. A message written offline is dated when it reached us.
+    const sent = serverNow();
     this.sql.exec(
       "INSERT OR IGNORE INTO messages (msg_id, peer, ciphertext, sent_at, created_at) " +
       "VALUES (?,?,?,?,?)", msgID, from, ciphertext, sent, stamp);
@@ -1792,7 +1783,7 @@ export class UserInbox {
     let seq;
     try {
       const payload = {
-        msg_id: msgID, from: this.identity(), ciphertext, sent_at: frame.sent_at,
+        msg_id: msgID, from: this.identity(), ciphertext,
       };
       // Direct for our own inbox. `inboxCall` would re-enter this object from inside
       // `webSocketMessage`, and whether that's delivered while we await it depends on input-gate
