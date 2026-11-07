@@ -42,10 +42,14 @@ const MAX_DEVICE_NAME_CHARS = 60;
 // cap into a friend's storage quota (see `handleSend`).
 const MAX_MSG_ID_CHARS = 64;
 // How far `sent_at` may sit from the server clock. The sender picks it and the AEAD binding
-// doesn't cover it, so a modified client could use it to reorder someone else's conversation.
-// A day back covers a message written offline; five minutes forward covers clock skew.
-const SENT_AT_PAST_SECONDS = 86400;
-const SENT_AT_FUTURE_SECONDS = 300;
+// doesn't cover it, and it's the sort key on the other side, so a sender's wrong clock (a fresh
+// Windows install with the zone left on US time and the hour fixed by hand runs hours off)
+// reordered the conversation. A message written offline is dated when it reached us instead.
+const SENT_AT_PAST_SECONDS = 60;
+const SENT_AT_FUTURE_SECONDS = 60;
+// Our clock at the moment a message frame leaves, so the receiver can move `sent_at` onto its
+// own clock (`Messaging.localTime`). Fractional: whole seconds tie a quick exchange.
+const serverNow = () => Date.now() / 1000;
 const RETENTION_SECONDS = 30 * 24 * 60 * 60;    // then the sweep drops it
 // Stored ciphertext per sender, a few thousand full-length messages. Generous for a person,
 // and the whole friend list at this size still fits a Durable Object.
@@ -1522,7 +1526,7 @@ export class UserInbox {
     return reply(200, {
       messages: page.map((m) => ({
         msg_id: m.msg_id, peer_id: m.peer, ciphertext: m.ciphertext,
-        sent_at: m.sent_at, seq: m.seq,
+        sent_at: m.sent_at, seq: m.seq, server_now: serverNow(),
       })),
       // The client keeps paging until this is false.
       has_more: messages.length > SYNC_PAGE,
@@ -1572,7 +1576,7 @@ export class UserInbox {
 
     await this.send({
       t: "message",
-      message: { msg_id: msgID, peer_id: from, ciphertext, sent_at: sent, seq: row.seq },
+      message: { msg_id: msgID, peer_id: from, ciphertext, sent_at: sent, seq: row.seq, server_now: serverNow() },
     });
 
     // Arm the push even when a socket took it: connected isn't received, and a sleeping Mac's
