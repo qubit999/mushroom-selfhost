@@ -416,8 +416,15 @@ ID5=$(printf '%s' "$CREATE5" | python3 -c 'import json,sys; print(json.load(sys.
 curl -s -o /dev/null -X PUT "${AUTH[@]}" --data-binary @/tmp/mf-test.pdf "$BASE/v1/files/$ID5/content"
 LICHASH=$(d1 "SELECT license_hash FROM files WHERE id = '$ID5'" --json 2>/dev/null | grep -o '"license_hash": "[^"]*"' | cut -d'"' -f4)
 
+# A second row on the same sale, as an App Store hash that redeemed this key would be. Seats and
+# quotas are per sale, so the block has to reach it too.
+d1 "UPDATE licenses SET gumroad_sale_id = 'test-sale-$$' WHERE license_hash = '$LICHASH';
+    INSERT OR REPLACE INTO licenses (license_hash, status, checked_at, created_at, gumroad_sale_id)
+    VALUES ('sibling-$$', 'active', 0, 0, 'test-sale-$$');" >/dev/null 2>&1
 want "admin blocks the licence" 200 \
   "$(status ${AS[@]+"${AS[@]}"} -X POST "${ADMIN[@]}" -d "{\"license_hash\":\"$LICHASH\"}" "$ABASE/admin/licenses/block")"
+SIBLING=$(d1 "SELECT status FROM licenses WHERE license_hash = 'sibling-$$'" --json 2>/dev/null | grep -c '"blocked"')
+[ "$SIBLING" -ge 1 ] && ok "the block reaches every row of the sale" || bad "the block reaches every row of the sale" "sibling not blocked"
 GONE=$(d1 "SELECT state FROM files WHERE id = '$ID5'" --json 2>/dev/null | grep -c '"deleted"')
 [ "$GONE" -ge 1 ] && ok "block deleted the licence's live files" || bad "block left files live" "state not deleted"
 # The device token was revoked with the licence, so the app is locked out at the door.
@@ -428,6 +435,9 @@ want "a blocked licence's token is dead" 401 "$(status "${AUTH[@]}" "$BASE/v1/fi
 # No real AppTransaction JWS is obtainable outside a TestFlight or App Store install, so
 # these pin the SHAPE of the credential branch: which inputs are refused, and with which
 # code. The happy path is only reachable from TestFlight.
+python3 -c 'print("{\"license_key\":\"" + "A" * 70000 + "\"}")' > /tmp/mf-huge.json
+want "an oversized activation body is refused before parsing" 413 \
+  "$(status -X POST -H 'content-type: application/json' --data-binary @/tmp/mf-huge.json "$BASE/v1/devices/activate")"
 want "activate with neither credential is 400" 400 \
   "$(status -X POST -H 'content-type: application/json' -d "{\"device_name\":\"t\"}" "$BASE/v1/devices/activate")"
 want "activate with BOTH credentials is 400"   400 \

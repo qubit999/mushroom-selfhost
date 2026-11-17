@@ -379,6 +379,10 @@ json='{"public_key":"'"$PROBE_KEY"'","device_name":"P"}'
 want "no credential at all is refused"        "400" "$(activate "$json")"
 json='{"public_key":"'"$PROBE_KEY"'","device_name":"P","setapp_code":"'"$(printf 'x%.0s' $(seq 600))"'"}'
 want "an oversized code is refused"           "400" "$(activate "$json")"
+python3 -c 'print("{\"license_key\":\"" + "A" * 70000 + "\"}")' > "$BODY.huge"
+want "an oversized body is refused unparsed"  "413" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' \
+     --data-binary @"$BODY.huge" "$BASE/v1/devices/activate")"
 
 echo
 # A token in the URL would land in Workers Logs, so the socket takes it from the header only.

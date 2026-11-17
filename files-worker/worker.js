@@ -457,6 +457,16 @@ function objectBody(value) {
   throw new TypeError("body is not an object");
 }
 
+// Several JWS plus small fields fit in a fraction of this.
+const MAX_JSON_BODY = 64 * 1024;
+
+/// Checked before `request.json()`, which buffers whatever arrives, on a route a stranger can
+/// reach. Same reasoning as the report form's pre-check: a missing length is refused too.
+function jsonTooBig(request) {
+  const declared = Number(request.headers.get("content-length"));
+  return !Number.isInteger(declared) || declared <= 0 || declared > MAX_JSON_BODY;
+}
+
 // ---------------------------------------------------------------- throttle
 
 // Per hour, like mushroom-messaging, and for the same reason: activation answers before
@@ -553,6 +563,7 @@ async function refusal(request, env, ctx) {
 // ---------------------------------------------------------------- routes
 
 async function activateDevice(request, env) {
+  if (jsonTooBig(request)) return fail(413, "too_big");
   let body;
   try {
     body = objectBody(await request.json());
@@ -753,9 +764,14 @@ async function activateDevice(request, env) {
   // The next activation must not undo an admin block, or the app re-activates and sharing
   // resumes with a fresh token. A Gumroad key could be revoked at Gumroad instead; an App
   // Store hash has no such lever, since this Worker never re-asks Apple.
-  const state = await env.DB.prepare("SELECT status FROM licenses WHERE license_hash = ?")
-    .bind(hash).first();
-  if (state?.status !== "active") return fail(403, "revoked");
+  //
+  // A block on any row of the same sale counts: seats and quotas are per sale, so a key blocked
+  // here would otherwise come back as an App Store hash redeeming that key, or the reverse.
+  const state = await env.DB.prepare(
+    "SELECT status, EXISTS (SELECT 1 FROM licenses s WHERE s.gumroad_sale_id = licenses.gumroad_sale_id " +
+    "AND s.status = 'blocked') AS sale_blocked FROM licenses WHERE license_hash = ?"
+  ).bind(hash).first();
+  if (state?.status !== "active" || state?.sale_blocked) return fail(403, "revoked");
 
   // This Mac's previous row goes first, making a re-activation a reclaim, not a second seat. The
   // client sends the device id it holds; otherwise its stale row looks like another Mac's, the
@@ -771,16 +787,6 @@ async function activateDevice(request, env) {
     ).bind(stamp, priorID, hash).run();
   }
 
-  // Past the cap, evict the least-recently-seen Mac rather than refuse: a 409 would strand
-  // someone who reinstalled twice, and the evicted Mac re-activates on its next 401.
-  const live = await env.DB.prepare(
-    "SELECT id FROM devices WHERE license_hash = ? AND revoked_at IS NULL ORDER BY last_seen_at DESC"
-  ).bind(hash).all();
-  const doomed = (live.results ?? []).slice(deviceBudget - 1);
-  for (const device of doomed) {
-    await env.DB.prepare("UPDATE devices SET revoked_at = ? WHERE id = ?").bind(stamp, device.id).run();
-  }
-
   const token = shareToken() + shareToken();       // 32 bytes of entropy for a bearer token
   const id = crypto.randomUUID();
   const name = typeof body.device_name === "string"
@@ -790,6 +796,19 @@ async function activateDevice(request, env) {
   await env.DB.prepare(
     "INSERT INTO devices (id, license_hash, token_hash, name, created_at, last_seen_at) VALUES (?,?,?,?,?,?)"
   ).bind(id, hash, await sha256Hex(token), name, stamp, stamp).run();
+
+  // Past the cap, evict the least-recently-seen Mac rather than refuse: a 409 would strand
+  // someone who reinstalled twice, and the evicted Mac re-activates on its next 401.
+  //
+  // After the insert, keeping this device and the newest others: counted before it, parallel
+  // activations of one key each saw a free seat and all kept theirs.
+  const live = await env.DB.prepare(
+    "SELECT id FROM devices WHERE license_hash = ? AND revoked_at IS NULL AND id != ? " +
+    "ORDER BY last_seen_at DESC"
+  ).bind(hash, id).all();
+  for (const device of (live.results ?? []).slice(deviceBudget - 1)) {
+    await env.DB.prepare("UPDATE devices SET revoked_at = ? WHERE id = ?").bind(stamp, device.id).run();
+  }
 
   // The limits travel with the token so the app shows "up to 95 MB" from the server's answer,
   // and changing a limit needs no app release.
@@ -841,6 +860,7 @@ function requireLicense(auth) {
 async function createFile(request, env, auth) {
   const blocked = requireLicense(auth);
   if (blocked) return blocked;
+  if (jsonTooBig(request)) return fail(413, "too_big");
 
   let body;
   try {
@@ -1168,7 +1188,9 @@ const RECEIVE_PAGE = `<!doctype html>
         });
     }).then(function (plaintext) {
       var link = document.createElement("a");
-      link.href = URL.createObjectURL(new Blob([plaintext]));
+      // Typed, so a browser that opens the blob instead of downloading it can't render the
+      // uploader's bytes as a document on this origin.
+      link.href = URL.createObjectURL(new Blob([plaintext], { type: "application/octet-stream" }));
       link.download = filename;
       link.click();
       setTimeout(function () { URL.revokeObjectURL(link.href); }, 60000);
@@ -1430,8 +1452,10 @@ async function abuseReport(request, env, ctx) {
     return reportReply(400, { code: "bad_contact", message: "Please give a name and an email we can reply to." }, origin, env);
   }
 
-  // From here the answer is identical whether or not the link resolves; any difference in
-  // status, body or visible timing would make this an oracle for guessing share tokens.
+  // From here the status and body are identical whether or not the link resolves; a difference
+  // would make this an oracle for guessing share tokens. Timing still differs (a real link costs
+  // three queries and an email first), which is tolerable: tokens are 128-bit and every probe
+  // costs a Turnstile solve.
   const accepted = reportReply(200, { message: REPORT_ACCEPTED }, origin, env);
 
   const file = await env.DB.prepare(
@@ -1588,21 +1612,31 @@ async function adminBlockLicense(request, env) {
   const row = await env.DB.prepare("SELECT license_hash FROM licenses WHERE license_hash = ?").bind(hash).first();
   if (!row) return fail(404, "not_found");
 
+  // Every row of the sale, not just this hash: seats and quotas are shared per sale, so a key
+  // blocked alone could come back as the App Store hash that redeemed it, or the reverse.
+  const rows = await env.DB.prepare(
+    "SELECT license_hash FROM licenses WHERE license_hash = ? OR (gumroad_sale_id IS NOT NULL AND " +
+    "gumroad_sale_id = (SELECT gumroad_sale_id FROM licenses WHERE license_hash = ?))"
+  ).bind(hash, hash).all();
+
   // 'blocked', not 'revoked': a Gumroad revocation can legitimately clear (a reversed refund
   // re-verifies as active), and the activateDevice upsert allows that. A block must survive
   // it, and for an App Store hash it's the only lever, since this Worker never re-asks Apple.
   // Same split as mushroom-messaging.
-  await env.DB.prepare("UPDATE licenses SET status = 'blocked' WHERE license_hash = ?").bind(hash).run();
-  await env.DB.prepare("UPDATE devices SET revoked_at = ? WHERE license_hash = ? AND revoked_at IS NULL")
-    .bind(now(), hash).run();
+  let deleted = 0;
+  for (const { license_hash: blockedHash } of rows.results ?? []) {
+    await env.DB.prepare("UPDATE licenses SET status = 'blocked' WHERE license_hash = ?").bind(blockedHash).run();
+    await env.DB.prepare("UPDATE devices SET revoked_at = ? WHERE license_hash = ? AND revoked_at IS NULL")
+      .bind(now(), blockedHash).run();
+    const live = await env.DB.prepare(
+      "SELECT id FROM files WHERE license_hash = ? AND state IN ('pending','ready')"
+    ).bind(blockedHash).all();
+    for (const file of live.results ?? []) await purgeFile(env, file.id);
+    deleted += (live.results ?? []).length;
+  }
 
-  const live = await env.DB.prepare(
-    "SELECT id FROM files WHERE license_hash = ? AND state IN ('pending','ready')"
-  ).bind(hash).all();
-  for (const file of live.results ?? []) await purgeFile(env, file.id);
-
-  console.log(`admin blocked license files=${(live.results ?? []).length}`);
-  return reply(200, { blocked: true, files_deleted: (live.results ?? []).length });
+  console.log(`admin blocked license rows=${(rows.results ?? []).length} files=${deleted}`);
+  return reply(200, { blocked: true, files_deleted: deleted });
 }
 
 // ---------------------------------------------------------------- cron

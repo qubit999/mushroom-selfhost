@@ -38,8 +38,13 @@ RUN npm ci \
 # A named volume takes its ownership from the image directory it's first mounted over, so
 # creating these as `node` means nothing has to run as root to chown them later. workerd also
 # won't start if a `disk` path is missing, which callers see only as "server never came up".
+#
+# The code stays root's: anything running as `node` could otherwise rewrite the entrypoint or the
+# bundle, and the change would survive a restart. The one file `node` writes there is the
+# derived config, which must sit beside dist/ because capnp resolves imports relative to it.
 RUN mkdir -p /var/lib/mushroom/do-messaging /var/lib/mushroom/do-files /var/lib/mushroom/blobs \
              /var/backups/mushroom /run/mushroom /run/blobd \
- && chown -R node:node /var/lib/mushroom /var/backups/mushroom /run/mushroom /run/blobd /opt/mushroom
+ && chown -R node:node /var/lib/mushroom /var/backups/mushroom /run/mushroom /run/blobd \
+ && install -m 600 -o node -g node /dev/null /opt/mushroom/config.capnp
 
 USER node

@@ -23,8 +23,9 @@ build() {
   echo "==> building $worker"
 
   # The Apple library is a real dependency of App Store activation (imported inside the
-  # handler), so install it before bundling.
-  ( cd "$worker-worker" && npm install --silent --no-audit --no-fund )
+  # handler), so install it before bundling. `ci`, from the lockfile: `install` re-resolves its
+  # transitive dependencies, and this bundles the code holding a company's messages.
+  ( cd "$worker-worker" && npm ci --silent --no-audit --no-fund )
 
   # The pinned local copy, never npx's newest: this bundles the code holding a company's messages.
   ( cd "$worker" && "$ROOT/node_modules/.bin/wrangler" deploy --dry-run \

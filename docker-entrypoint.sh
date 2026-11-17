@@ -11,6 +11,9 @@ set -eu
 
 cd /opt/mushroom
 
+# For every start, not only the first: config.capnp holds ADMIN_TOKEN and the enrolment list.
+umask 077
+
 # ADMIN_TOKEN and the durable-object uniqueKeys are generated once and kept on the state volume.
 #
 # The uniqueKeys are why: changing one makes every existing durable object unreachable, so fresh
@@ -21,7 +24,6 @@ cd /opt/mushroom
 SECRETS=/var/lib/mushroom/secrets.env
 if [ ! -f "$SECRETS" ]; then
   hex() { node -e 'console.log(require("crypto").randomBytes(32).toString("hex"))'; }
-  umask 077
   { echo "ADMIN_TOKEN=$(hex)"; echo "UNIQUE_KEY=$(hex)"; } > "$SECRETS"
   echo "mushroom: generated $SECRETS (admin token and durable-object keys). Back this up."
 fi

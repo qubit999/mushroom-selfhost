@@ -23,6 +23,10 @@ const MAX_MESSAGE_CHARACTERS = 4000;
 // A sealed box is base64 of nonce + ciphertext + tag: base64 costs 4/3, AES-GCM adds 28 bytes,
 // and a character can be four UTF-8 bytes. Rounded up. It bounds the stored blob, not the text.
 const MAX_CIPHERTEXT_CHARS = Math.ceil((MAX_MESSAGE_CHARACTERS * 4 + 28) * 4 / 3) + 64;
+// A send frame's other fields are a few hundred characters; the slack keeps a slightly
+// oversized message on the path that answers `rejected` instead of silence.
+const MAX_FRAME_CHARS = MAX_CIPHERTEXT_CHARS + 4096;
+const MAX_SOCKETS_PER_DEVICE = 4;
 const MAX_FRIENDS = 50;
 // Must equal `LicenseVerifier.seatCap` and files-worker's copy. The app spends five activations
 // on Gumroad and the server keeps five device rows: one allowance, and `saleSeatBudget` counts
@@ -196,6 +200,16 @@ async function throttle(env, key, bucket, limit, windowSeconds) {
 function objectBody(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) return value;
   throw new TypeError("body is not an object");
+}
+
+// Several JWS plus small fields fit in a fraction of this. Same cap as files-worker.
+const MAX_JSON_BODY = 64 * 1024;
+
+/// Checked before `request.json()`, which buffers whatever arrives, on a route a stranger can
+/// reach. A missing length is refused too.
+function jsonTooBig(request) {
+  const declared = Number(request.headers.get("content-length"));
+  return !Number.isInteger(declared) || declared <= 0 || declared > MAX_JSON_BODY;
 }
 
 // ---------------------------------------------------------------- license
@@ -574,8 +588,7 @@ async function authenticate(request, env, ctx, opts) {
 ///
 /// `MessagingClient.openSocket` sends an Authorization header, and that's the path to keep:
 /// with `observability` on, Workers Logs records the URL verbatim, so a query-string token is a
-/// never-expiring credential in a searchable index. The `?token=` fallback is only for builds
-/// from before the header; drop it once none are left.
+/// never-expiring credential in a searchable index, so no query-string token is accepted.
 /// `allowExpired` drops only the entitlement clause, never the device, revocation or
 /// license-status checks.
 ///
@@ -641,6 +654,7 @@ async function refusal(token, env, ctx) {
 // ---------------------------------------------------------------- routes
 
 async function activateDevice(request, env) {
+  if (jsonTooBig(request)) return fail(413, "too_big");
   let body;
   try {
     body = objectBody(await request.json());
@@ -889,9 +903,13 @@ async function activateDevice(request, env) {
     ).bind(hash, stamp, stamp, saleID, source, entitledUntil).run();
   }
 
-  const blocked = await env.DB.prepare("SELECT status FROM licenses WHERE license_hash = ?")
-    .bind(hash).first();
-  if (blocked?.status !== "active") return fail(403, "revoked");
+  // A block on any row of the same sale counts, as in files-worker: seats are per sale, so a key
+  // blocked here would otherwise come back as an App Store hash redeeming it, or the reverse.
+  const blocked = await env.DB.prepare(
+    "SELECT status, EXISTS (SELECT 1 FROM licenses s WHERE s.gumroad_sale_id = licenses.gumroad_sale_id " +
+    "AND s.status = 'blocked') AS sale_blocked FROM licenses WHERE license_hash = ?"
+  ).bind(hash).first();
+  if (blocked?.status !== "active" || blocked?.sale_blocked) return fail(403, "revoked");
 
   const identityID = await identityFor(body.public_key);
 
@@ -959,23 +977,6 @@ async function activateDevice(request, env) {
     }
   }
 
-  // Past the cap, evict the least-recently-seen Mac rather than refuse: a 409 would strand
-  // someone who reinstalled twice, and the evicted Mac re-activates on its next 401. Scoped to
-  // the license, not the identity: five devices, however many keys.
-  const live = await env.DB.prepare(
-    "SELECT id, identity_id FROM devices WHERE license_hash = ? AND revoked_at IS NULL " +
-    "ORDER BY last_seen_at DESC"
-  ).bind(hash).all();
-  for (const device of (live.results ?? []).slice(deviceBudget - 1)) {
-    await env.DB.prepare("UPDATE devices SET revoked_at = ? WHERE id = ?")
-      .bind(stamp, device.id).run();
-    // And out of the inbox, where `alarm()` looks. A row left there keeps a live APNs token with
-    // a frozen `last_acked_seq`, so every message pushes to it though the Mac is acking under its
-    // new id. `identity_id` is selected above only to address the inbox.
-    await inboxCall(env, device.identity_id, "/devices/remove", { device: device.id })
-      .catch(() => {});
-  }
-
   const token = randomToken() + randomToken();     // 32 bytes of entropy for a bearer token
   const id = crypto.randomUUID();
   const name = typeof body.device_name === "string"
@@ -986,6 +987,26 @@ async function activateDevice(request, env) {
     "INSERT INTO devices (id, identity_id, license_hash, token_hash, name, created_at, last_seen_at) " +
     "VALUES (?,?,?,?,?,?,?)"
   ).bind(id, identityID, hash, await sha256Hex(token), name, stamp, stamp).run();
+
+  // Past the cap, evict the least-recently-seen Mac rather than refuse: a 409 would strand
+  // someone who reinstalled twice, and the evicted Mac re-activates on its next 401. Scoped to
+  // the license, not the identity: five devices, however many keys.
+  //
+  // After the insert, keeping this device and the newest others: counted before it, parallel
+  // activations of one key each saw a free seat and all kept theirs.
+  const live = await env.DB.prepare(
+    "SELECT id, identity_id FROM devices WHERE license_hash = ? AND revoked_at IS NULL AND id != ? " +
+    "ORDER BY last_seen_at DESC"
+  ).bind(hash, id).all();
+  for (const device of (live.results ?? []).slice(deviceBudget - 1)) {
+    await env.DB.prepare("UPDATE devices SET revoked_at = ? WHERE id = ?")
+      .bind(stamp, device.id).run();
+    // And out of the inbox, where `alarm()` looks. A row left there keeps a live APNs token with
+    // a frozen `last_acked_seq`, so every message pushes to it though the Mac is acking under its
+    // new id. `identity_id` is selected above only to address the inbox.
+    await inboxCall(env, device.identity_id, "/devices/remove", { device: device.id })
+      .catch(() => {});
+  }
 
   return reply(201, { device_id: id, identity_id: identityID, token, limits: limits() });
 }
@@ -1070,8 +1091,8 @@ async function revokeDevice(request, env, auth) {
 /// Setapp Mac can pair a phone at all. The code is a bearer secret for ten minutes: stored hashed,
 /// returned once, never persisted or logged by `PairPhoneView`.
 ///
-/// No rate limit beyond the general gate: minting is cheap, codes die fast, and someone who
-/// scans badly and taps again shouldn't be told to wait.
+/// Throttled generously (`LINKS_PER_HOUR`): someone who scans badly and taps again shouldn't be
+/// told to wait, but a loop shouldn't mint without bound either.
 async function createLink(env, auth) {
   // Each code is a live credential and a D1 row until the daily sweep, so a loop would mint
   // both without bound. A person pairs a phone a few times a year.
@@ -1700,6 +1721,16 @@ export class UserInbox {
       "ON CONFLICT(device_id) DO UPDATE SET updated_at = excluded.updated_at",
       deviceID, now());
 
+    // A device needs one socket, two while reconnecting. Unbounded, one token could open
+    // thousands, and on a self-hosted box that is the whole workerd process. Past the cap the
+    // older ones go; order isn't kept, so all of them, and a real client reconnects at once.
+    const existing = this.ctx.getWebSockets(deviceID);
+    if (existing.length >= MAX_SOCKETS_PER_DEVICE) {
+      for (const socket of existing) {
+        try { socket.close(1008, "replaced"); } catch { /* gone already */ }
+      }
+    }
+
     const wasOffline = this.sockets().length === 0;
     const pair = new WebSocketPair();
     // Hibernation: an idle conversation costs nothing, and the DO can leave memory while the
@@ -1721,6 +1752,9 @@ export class UserInbox {
       // URLSessionWebSocketTask.send(.data) is binary, browsers and Node send text. JSON.parse
       // on an ArrayBuffer throws, and the catch would silently drop every message from the Mac
       // app while the socket looks healthy.
+      // Sized before parsing: the largest real frame is a send carrying MAX_CIPHERTEXT_CHARS.
+      // Anything well past that is dropped unread, not parsed into memory.
+      if ((typeof raw === "string" ? raw.length : raw.byteLength) > MAX_FRAME_CHARS) return;
       const text = typeof raw === "string" ? raw : new TextDecoder().decode(raw);
       frame = JSON.parse(text);
     } catch {
@@ -2187,16 +2221,26 @@ async function adminBlockLicense(request, env) {
   const row = await env.DB.prepare("SELECT license_hash FROM licenses WHERE license_hash = ?").bind(hash).first();
   if (!row) return fail(404, "not_found");
 
-  await env.DB.prepare("UPDATE licenses SET status = 'blocked' WHERE license_hash = ?").bind(hash).run();
-  const devices = await env.DB.prepare(
-    "UPDATE devices SET revoked_at = ? WHERE license_hash = ? AND revoked_at IS NULL RETURNING id, identity_id"
-  ).bind(now(), hash).all();
-  for (const device of devices.results ?? []) {
-    await inboxCall(env, device.identity_id, "/devices/remove", { device: device.id }).catch(() => {});
+  // Every row of the sale, as in files-worker: seats are shared per sale, so a key blocked alone
+  // could come back as the App Store hash that redeemed it, or the reverse.
+  const rows = await env.DB.prepare(
+    "SELECT license_hash FROM licenses WHERE license_hash = ? OR (gumroad_sale_id IS NOT NULL AND " +
+    "gumroad_sale_id = (SELECT gumroad_sale_id FROM licenses WHERE license_hash = ?))"
+  ).bind(hash, hash).all();
+
+  let count = 0;
+  for (const { license_hash: blockedHash } of rows.results ?? []) {
+    await env.DB.prepare("UPDATE licenses SET status = 'blocked' WHERE license_hash = ?").bind(blockedHash).run();
+    const devices = await env.DB.prepare(
+      "UPDATE devices SET revoked_at = ? WHERE license_hash = ? AND revoked_at IS NULL RETURNING id, identity_id"
+    ).bind(now(), blockedHash).all();
+    for (const device of devices.results ?? []) {
+      await inboxCall(env, device.identity_id, "/devices/remove", { device: device.id }).catch(() => {});
+    }
+    count += (devices.results ?? []).length;
   }
 
-  const count = (devices.results ?? []).length;
-  console.log(`admin blocked license devices=${count}`);
+  console.log(`admin blocked license rows=${(rows.results ?? []).length} devices=${count}`);
   return reply(200, { blocked: true, devices_revoked: count });
 }
 

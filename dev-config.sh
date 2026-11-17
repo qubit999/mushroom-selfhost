@@ -66,7 +66,11 @@ EXTRA=""
 # Every value below lands in a sed replacement and then a capnp string, so a stray `"` ends the
 # string (and can add a binding) and a `&` or `#` breaks the sed. Hand-typed ones are checked; the
 # only one that can reasonably contain `&` is BRAND_URL, so that one is escaped instead.
+#
+# grep matches per line, so a value with a newline passes if any one line does, and sed then
+# carries the rest into the capnp text. No value here has a reason to span lines.
 check() {
+  case "$2" in *$'\n'* | *$'\r'*) echo "dev-config.sh: $1 must be a single line" >&2; exit 1 ;; esac
   printf '%s\n' "$2" | grep -Eq "$3" && return 0
   echo "dev-config.sh: $1 is not valid here: $2" >&2
   exit 1
