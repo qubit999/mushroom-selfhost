@@ -598,6 +598,10 @@ async function authenticateToken(token, env, ctx, { allowExpired = false, touch 
     (allowExpired ? "" : "AND (l.entitled_until IS NULL OR l.entitled_until > ?)")
   ).bind(...(allowExpired ? [tokenHash] : [tokenHash, now()])).first();
   if (!row) return null;
+  // On a self-hosted box removing a hash is how an operator removes a person, and its licences
+  // never expire, so checking only at activation would leave their devices working for good.
+  // Also under `allowExpired`, so `refusal` answers `reactivate`, not `entitlement_lapsed`.
+  if (!enrolmentAllows(row.license_hash, env)) return null;
   // A blocked license keeps its token but loses the service. Revoked is Gumroad's word (refund,
   // chargeback); blocked is ours (abuse).
   if (row.status !== "active") return null;
@@ -919,7 +923,7 @@ async function activateDevice(request, env) {
   }
 
   // The id is the key's hash, so an existing row already holds this key. `license_hash` is set
-  // on first claim and never moved; COALESCE binds a NULL from before the column existed to
+  // on first claim and moved only by `migrateIdentity` above; COALESCE binds a NULL from before the column existed to
   // whoever activates next.
   await env.DB.prepare(
     "INSERT INTO identities (id, public_key, license_hash, created_at) VALUES (?, ?, ?, ?) " +
@@ -1871,7 +1875,8 @@ export class UserInbox {
     let row;
     try {
       row = await this.env.DB.prepare(
-        "SELECT l.status FROM devices d JOIN licenses l ON l.license_hash = d.license_hash " +
+        "SELECT l.status, l.license_hash FROM devices d " +
+        "JOIN licenses l ON l.license_hash = d.license_hash " +
         // The same entitlement clause as `authenticateToken`. This socket outlives its
         // authentication and carries messages, acks, typing and presence, so without it a lapsed
         // subscriber who never quits the app keeps Friends while every HTTP route 401s.
@@ -1885,7 +1890,8 @@ export class UserInbox {
     }
     // Only a real answer resets the throttle.
     await this.ctx.storage.put(key, now());
-    if (row && row.status === "active") return true;
+    // Enrolment too, the same rule as `authenticateToken`, for a socket that outlives it.
+    if (row && row.status === "active" && enrolmentAllows(row.license_hash, this.env)) return true;
     this.dropSockets(device);
     return false;
   }
@@ -1899,12 +1905,15 @@ export class UserInbox {
     if (!ids.length) return new Set();
     try {
       const rows = await this.env.DB.prepare(
-        "SELECT d.id AS id FROM devices d JOIN licenses l ON l.license_hash = d.license_hash " +
+        "SELECT d.id AS id, l.license_hash FROM devices d " +
+        "JOIN licenses l ON l.license_hash = d.license_hash " +
         `WHERE d.id IN (${ids.map(() => "?").join(",")}) AND d.revoked_at IS NULL ` +
         "AND l.status = 'active' " +
         "AND (l.entitled_until IS NULL OR l.entitled_until > ?)"
       ).bind(...ids, now()).all();
-      return new Set((rows.results ?? []).map((r) => r.id));
+      // No push to a device whose licence the operator removed from the enrolment list.
+      return new Set((rows.results ?? [])
+        .filter((r) => enrolmentAllows(r.license_hash, this.env)).map((r) => r.id));
     } catch {
       return null;   // fail open, see the caller
     }

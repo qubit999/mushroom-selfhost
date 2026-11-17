@@ -18,6 +18,9 @@ const GUMROAD_PRODUCT_IDS = [
 
 const MAX_FILE_BYTES = 95 * 1024 * 1024;        // 95 MiB, under Cloudflare's 100 MB body cap
 const TTL_SECONDS = 24 * 60 * 60;
+// How long an upload holds its claim on a pending row (see `uploadContent`). Long enough for a
+// max-size file on a slow line; past it the upload is presumed dead and a retry may take over.
+const UPLOAD_CLAIM_SECONDS = 30 * 60;
 const MAX_ACTIVE_FILES_PER_LICENSE = 50;
 // 50 max-size files would be 4.6 GiB, so this binds first at ~32. On purpose: the file count
 // caps ordinary drops, this caps the bill.
@@ -514,6 +517,10 @@ async function authenticate(request, env, ctx, { allowExpired = false, touch = t
     (allowExpired ? "" : "AND (l.entitled_until IS NULL OR l.entitled_until > ?)")
   ).bind(...(allowExpired ? [tokenHash] : [tokenHash, now()])).first();
   if (!row) return null;
+  // On a self-hosted box removing a hash is how an operator removes a person, and its licences
+  // never expire, so checking only at activation would leave their devices working for good.
+  // Also under `allowExpired`, so `refusal` answers `reactivate`, not `entitlement_lapsed`.
+  if (!enrolmentAllows(row.license_hash, env)) return null;
 
   // Not when the caller only asks why a request failed (`refusal`). Seat eviction orders by
   // `last_seen_at`, so bumping it for a request we're about to 401 keeps a device that only
@@ -922,6 +929,21 @@ async function uploadContent(request, env, auth, id) {
   if (length !== row.size) return fail(400, "size_mismatch");
   if (!request.body) return fail(400, "bad_request");
 
+  // Claim the row before touching R2. Without it two PUTs for one id both write the object, and
+  // a slow second one landing after a takedown, a delete or the sweep would bring the file back
+  // under its old link. On a pending row `uploaded_at` is the claim stamp; nothing else reads it
+  // until the row is ready.
+  const claim = now();
+  const claimed = await env.DB.prepare(
+    "UPDATE files SET uploaded_at = ? WHERE id = ? AND state = 'pending' " +
+    "AND (uploaded_at IS NULL OR uploaded_at < ?)"
+  ).bind(claim, id, claim - UPLOAD_CLAIM_SECONDS).run();
+  if (!claimed.meta?.changes) return fail(409, "upload_in_progress");
+  // Hands the row back after a failed attempt, so retrying this exact PUT stays free.
+  const release = () => env.DB.prepare(
+    "UPDATE files SET uploaded_at = NULL WHERE id = ? AND state = 'pending' AND uploaded_at = ?"
+  ).bind(id, claim).run().catch(() => {});
+
   const key = `f/${id}`;
   let object;
   try {
@@ -938,7 +960,7 @@ async function uploadContent(request, env, auth, id) {
     await env.FILES.delete(key).catch(() => {});
     // The message is R2's own and carries the object key at worst, never a filename.
     console.log(`upload failed id=${id} err=${error?.message ?? "unknown"}`);
-    // The row stays pending, so retrying this exact PUT is free.
+    await release();
     return fail(500, "upload_failed");
   }
 
@@ -951,12 +973,24 @@ async function uploadContent(request, env, auth, id) {
   const sealed = request.headers.get("x-mushroom-encrypted") === "1";
   if (!sealed && !(await storedBytesMatchType(env, key, row.content_type))) {
     await env.FILES.delete(key).catch(() => {});
+    await release();
     return fail(415, "type_mismatch");
   }
 
-  await env.DB.prepare(
-    "UPDATE files SET state = 'ready', uploaded_at = ?, size = ? WHERE id = ?"
-  ).bind(now(), object.size, id).run();
+  // Only if the row is still pending and still ours. A row deleted, purged or swept while the
+  // body streamed must not come back, so drop the bytes just written. A row someone else
+  // finished after our claim went stale keeps its object.
+  const finished = await env.DB.prepare(
+    "UPDATE files SET state = 'ready', uploaded_at = ?, size = ? " +
+    "WHERE id = ? AND state = 'pending' AND uploaded_at = ?"
+  ).bind(now(), object.size, id, claim).run();
+  if (!finished.meta?.changes) {
+    const current = await env.DB.prepare("SELECT state FROM files WHERE id = ?").bind(id).first();
+    if (current?.state !== "ready" && current?.state !== "pending") {
+      await env.FILES.delete(key).catch(() => {});
+    }
+    return fail(410, "gone");
+  }
 
   return reply(200, { url: `${env.PUBLIC_BASE}/f/${row.token}`, expires_at: row.expires_at });
 }

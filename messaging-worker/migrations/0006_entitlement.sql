@@ -8,8 +8,9 @@
 -- Unix seconds, like every timestamp here. Read by the auth JOIN in `authenticateToken` (except
 -- on the release route, where cleanup must keep working), by `stillAuthorized` on the hibernating
 -- socket and by `entitledDevices` in the push alarm; written by the upsert in `activateDevice`,
--- whose CASE is monotonic both ways: NULL never becomes a horizon, a horizon never becomes NULL.
--- Only horizon -> horizon moves, which is a renewal.
+-- whose CASE is monotonic both ways: on an active row NULL never becomes a horizon (a NULL left
+-- on a revoked row may take one), and a horizon never becomes NULL. Otherwise only
+-- horizon -> horizon moves, which is a renewal.
 --
 -- Same column as files-worker/migrations/0005_entitlement.sql. Both workers must agree or a
 -- subscriber would keep one feature and lose the other.

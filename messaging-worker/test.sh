@@ -168,7 +168,8 @@ ALICE_ID="$(sha "$ALICE_KEY")"
 BOB_ID="$(sha "$BOB_KEY")"
 ALICE_TOKEN="alice-test-token-do-not-use-in-production"
 BOB_TOKEN="bob-test-token-do-not-use-in-production"
-LICENSE="$(sha 'TEST-LICENSE')"
+# dev-config.sh's throwaway key: a self-hosted box enrols it by default and re-checks every request.
+LICENSE="$(sha 'SELFHOST-TEST-LICENCE')"
 NOW="$(date +%s)"
 
 d1 "INSERT OR REPLACE INTO licenses (license_hash, status, checked_at, created_at)

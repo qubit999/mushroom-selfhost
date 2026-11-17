@@ -96,14 +96,14 @@ curl "http://localhost:8787/__scheduled?cron=17+*+*+*+*"
 
 ## App Store activation
 
-`/v1/devices/activate` takes **exactly one** of `license_key` or `app_transaction`, and 400s
-on both or neither. The second is the App Store build's credential: it has no Gumroad key to
-present (`LicenseManager`'s APPSTORE stub never writes one), so it sends `AppTransaction`'s
-JWS and the Worker verifies it against a pinned Apple root. The identity is
+`/v1/devices/activate` takes **exactly one** of `license_key`, `app_transaction` or
+`setapp_code`, and 400s on more than one or none. `app_transaction` is the App Store build's
+credential: it has no Gumroad key to present (`LicenseManager`'s APPSTORE stub never writes
+one), so it sends `AppTransaction`'s JWS and the Worker verifies it against a pinned Apple root. The identity is
 `sha256("appstore:" + appTransactionId)`, which lands in the same `licenses.license_hash`
 column as a Gumroad key hash, so seats, quotas and bearer auth are all unchanged. Apple
 issues that id per Apple Account *and* per family group member, so a Family Sharing member
-gets their own three seats.
+gets their own five seats.
 
 `APPSTORE_APP_APPLE_ID` is `6792833686`, in `wrangler.jsonc` as a plain var rather than a
 secret: it is the id in every App Store URL, so hiding it would buy nothing and cost a
@@ -155,7 +155,7 @@ does both.
 
 - **Delete just the reported file.** Removes the object, marks the row deleted, clears the
   filename. Idempotent.
-- **Block the licence.** Sets its status to revoked, revokes every device token it has, and
+- **Block the licence.** Sets its status to blocked, revokes every device token it has, and
   deletes every file still live under it.
 
 Blocking stops **file sharing only**. The customer's app keeps working, because the app's

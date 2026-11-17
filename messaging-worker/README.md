@@ -88,13 +88,13 @@ npx wrangler deploy
 
 ## App Store activation
 
-`/v1/devices/activate` takes **exactly one** of `license_key` or `app_transaction`, and 400s
-on both or neither. The second is the App Store build's credential: it has no Gumroad key to
-present, so it sends `AppTransaction`'s JWS and the Worker verifies it against a pinned Apple
-root. The identity is `sha256("appstore:" + appTransactionId)`, which lands in the same
+`/v1/devices/activate` takes **exactly one** of `license_key`, `app_transaction`,
+`setapp_code` or `link_code`, and 400s on more than one or none. `app_transaction` is the App
+Store build's credential: it has no Gumroad key to present, so it sends `AppTransaction`'s JWS
+and the Worker verifies it against a pinned Apple root. The identity is `sha256("appstore:" + appTransactionId)`, which lands in the same
 `licenses.license_hash` column as a Gumroad key hash, so seats, the identity first-claim
 guard, `blocked`, and bearer auth are all unchanged. Apple issues that id per Apple Account
-*and* per family group member, so a Family Sharing member gets their own three seats.
+*and* per family group member, so a Family Sharing member gets their own five seats.
 
 `APPSTORE_APP_APPLE_ID` is `6792833686`, in `wrangler.jsonc` as a plain var rather than a
 secret: it is the id in every App Store URL. Apple's verifier requires it to check the JWS

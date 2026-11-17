@@ -101,14 +101,31 @@ else
   TOKEN="test-token-$$"
   HASH=$(printf '%s' "$TOKEN" | shasum -a 256 | cut -d' ' -f1)
   NOW=$(date +%s)
+  # The hash of dev-config.sh's throwaway key, so a self-hosted box enrols the seeded licence
+  # by default; every request re-checks enrolment there.
+  SEEDED=$(printf '%s' 'SELFHOST-TEST-LICENCE' | shasum -a 256 | cut -d' ' -f1)
   d1 "INSERT OR REPLACE INTO licenses (license_hash, status, checked_at, created_at)
-      VALUES ('testlicensehash', 'active', $NOW, $NOW);
+      VALUES ('$SEEDED', 'active', $NOW, $NOW);
       INSERT OR REPLACE INTO devices (id, license_hash, token_hash, name, created_at, last_seen_at)
-      VALUES ('test-device', 'testlicensehash', '$HASH', 'test.sh', $NOW, $NOW);" >/dev/null 2>&1
+      VALUES ('test-device', '$SEEDED', '$HASH', 'test.sh', $NOW, $NOW);" >/dev/null 2>&1
   ok "seeded a local licence and device (set MUSHROOM_TEST_LICENSE to test activation too)"
 fi
 
 AUTH=(-H "authorization: Bearer $TOKEN")
+
+# Self-hosted only: a hash taken off ENROLLMENT_HASHES must stop working at once, not at the
+# next activation, which on a box whose licences never expire never comes.
+if [ -n "$ADMIN_SOCK" ] && [ "${OPEN_ENROLLMENT:-0}" != "1" ]; then
+  GONE_TOKEN="unenrolled-token-$$"
+  GONE_LICENSE=$(printf '%s' 'NOT-ENROLLED' | shasum -a 256 | cut -d' ' -f1)
+  d1 "INSERT OR REPLACE INTO licenses (license_hash, status, checked_at, created_at)
+      VALUES ('$GONE_LICENSE', 'active', $(date +%s), $(date +%s));
+      INSERT OR REPLACE INTO devices (id, license_hash, token_hash, name, created_at, last_seen_at)
+      VALUES ('unenrolled-device', '$GONE_LICENSE',
+              '$(printf '%s' "$GONE_TOKEN" | shasum -a 256 | cut -d' ' -f1)', 'gone', 0, 0);" >/dev/null 2>&1
+  want "a device whose licence is not enrolled is 401" 401 \
+    "$(status -H "authorization: Bearer $GONE_TOKEN" "$BASE/v1/files")"
+fi
 want "a bogus bearer token is 401" 401 \
   "$(status -H 'authorization: Bearer nonsense' "$BASE/v1/files")"
 
@@ -164,6 +181,19 @@ want "upload succeeds" 200 \
   "$(status -X PUT "${AUTH[@]}" --data-binary @/tmp/mf-test.pdf "$BASE/v1/files/$ID/content")"
 want "second upload is 409" 409 \
   "$(status -X PUT "${AUTH[@]}" --data-binary @/tmp/mf-test.pdf "$BASE/v1/files/$ID/content")"
+
+# The upload claim. A held claim refuses a second PUT, or a slow one could land after a
+# takedown and revive the file; a claim past UPLOAD_CLAIM_SECONDS is a dead upload and yields.
+CLAIM=$(curl -s -X POST "${AUTH[@]}" -H 'content-type: application/json' \
+  -d "{\"name\":\"claim.pdf\",\"size\":$SIZE,\"content_type\":\"application/pdf\"}" "$BASE/v1/files")
+CLAIM_ID=$(printf '%s' "$CLAIM" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
+d1 "UPDATE files SET uploaded_at = $(date +%s) WHERE id = '$CLAIM_ID'" >/dev/null 2>&1
+want "an upload while another holds the claim is 409" 409 \
+  "$(status -X PUT "${AUTH[@]}" --data-binary @/tmp/mf-test.pdf "$BASE/v1/files/$CLAIM_ID/content")"
+d1 "UPDATE files SET uploaded_at = $(( $(date +%s) - 3600 )) WHERE id = '$CLAIM_ID'" >/dev/null 2>&1
+want "a stale claim yields to a retry" 200 \
+  "$(status -X PUT "${AUTH[@]}" --data-binary @/tmp/mf-test.pdf "$BASE/v1/files/$CLAIM_ID/content")"
+curl -s -o /dev/null -X DELETE "${AUTH[@]}" "$BASE/v1/files/$CLAIM_ID"
 
 # ---------------------------------------------------------------- download
 want "download works" 200 "$(status "$BASE/f/$STOKEN")"

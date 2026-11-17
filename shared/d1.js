@@ -42,8 +42,8 @@ class PreparedStatement {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ sql: this.sql, params: this.params }),
     });
-    // Must throw like D1 does: `throttle` catches and fails open, `requireLicense` doesn't.
-    // Swallowing it would turn a broken database into a limiter that always says yes.
+    // Must throw like D1 does: `throttle` catches and fails open, so swallowing it would turn a
+    // broken database into a limiter that always says yes.
     if (!response.ok) throw new Error(`selfhost D1: ${response.status} ${await response.text()}`);
     return response.json();
   }
@@ -61,7 +61,8 @@ class PreparedStatement {
     return { success: true, results, meta };
   }
 
-  /// `meta.changes` is read in one place: the single-use invite guarantee.
+  /// `meta.changes` gates the single-use invite (`acceptInvite`) and the file quota insert
+  /// (`createFile`), so a wrong count breaks one or the other.
   async run() {
     const { results, meta } = await this.#query();
     return { success: true, results, meta };
