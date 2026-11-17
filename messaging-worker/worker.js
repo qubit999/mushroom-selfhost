@@ -45,6 +45,9 @@ const MAX_MSG_ID_CHARS = 64;
 // own clock (`Messaging.localTime`). Fractional: whole seconds tie a quick exchange.
 const serverNow = () => Date.now() / 1000;
 const RETENTION_SECONDS = 30 * 24 * 60 * 60;    // then the sweep drops it
+// The expiry alarm wakes an inbox at most this often, so a busy one isn't woken per message as
+// each ages out. Messages therefore live up to a day past RETENTION_SECONDS.
+const RETENTION_SWEEP_MS = 24 * 60 * 60 * 1000;
 // Stored ciphertext per sender, a few thousand full-length messages. Generous for a person,
 // and the whole friend list at this size still fits a Durable Object.
 const MAX_STORED_CHARS_PER_PEER = 64 * 1024 * 1024;
@@ -1550,9 +1553,8 @@ export class UserInbox {
     if ((held?.n ?? 0) + String(ciphertext).length > MAX_STORED_CHARS_PER_PEER) {
       return fail(507, "inbox_full");
     }
-    // Retention runs here, not on a cron: Durable Objects can't be listed, so a cron couldn't
-    // reach them. On the write path, "we keep messages 30 days" is structurally true. Indexed,
-    // and bounded by this same delete, so it stays cheap.
+    // Retention runs here and on the inbox's own alarm (`armRetention`), not on a cron: Durable
+    // Objects can't be listed, so a cron couldn't reach them. Indexed, so it stays cheap.
     this.sql.exec("DELETE FROM messages WHERE created_at < ?", stamp - RETENTION_SECONDS);
     // Our clock, not the sender's: `sent_at` is the sole sort key on the other side
     // (`Messaging.ordered`, `conversationOrder`) and a client's clock can be anything. Even a
@@ -1607,6 +1609,8 @@ export class UserInbox {
         await this.ctx.storage.setAlarm(grace);
       }
     }
+    // Without APNs, or for our own message, nothing above armed anything.
+    await this.armRetention();
     return reply(200, { seq: row.seq });
   }
 
@@ -1994,13 +1998,33 @@ export class UserInbox {
   /// Per device, not a MAX across them: an iMac awake at the office acks instantly, and a
   /// global MAX would let that answer for the MacBook asleep in a bag. `last_pushed_seq` is
   /// per row too, so one device being notified can't suppress another.
+  ///
+  /// The one alarm slot serves two jobs. Push owns it while a push is due or retrying; otherwise
+  /// it is parked at the next message expiry, so an inbox nobody writes to or opens again still
+  /// drops its ciphertext. Retention on `deliver` alone kept an abandoned inbox's messages, and
+  /// its share of the disk, forever.
   async alarm() {
-    // Backstop for an alarm already persisted. `deliver` doesn't arm one without a key, but a
-    // DO may still hold an older alarm that would otherwise re-arm itself forever.
-    if (!apnsConfigured(this.env)) {
-      console.log("push: APNs not configured, alarm is a no-op");
-      return;
-    }
+    this.sql.exec("DELETE FROM messages WHERE created_at < ?", now() - RETENTION_SECONDS);
+    await this.pushAlarm();
+    await this.armRetention();
+  }
+
+  /// Park the alarm at the oldest message's expiry, unless push holds it. Inside `alarm()`,
+  /// `getAlarm` is null unless the handler has set one, so a retry armed by `pushAlarm` wins.
+  ///
+  /// Push's idle check in `deliver` (`pending === null`) still holds while parked: push clears
+  /// its attempt counter before it lets the slot go, so a parked slot never carries a budget.
+  async armRetention() {
+    if ((await this.ctx.storage.getAlarm()) !== null) return;
+    const oldest = this.one("SELECT MIN(created_at) AS t FROM messages")?.t;
+    if (oldest == null) return;   // empty inbox, nothing to expire, no wakes
+    await this.ctx.storage.setAlarm(
+      Math.max((oldest + RETENTION_SECONDS) * 1000, Date.now() + RETENTION_SWEEP_MS));
+  }
+
+  async pushAlarm() {
+    // No key, no push. The alarm still ran for retention; `armRetention` re-parks it.
+    if (!apnsConfigured(this.env)) return;
 
     const latest = this.one("SELECT MAX(seq) AS s FROM messages")?.s ?? 0;
     if (!latest) return;

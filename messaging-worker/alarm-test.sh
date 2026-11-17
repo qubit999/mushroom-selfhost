@@ -150,16 +150,19 @@ import json, sys
 d = json.load(open(sys.argv[1]))
 now = int(sys.argv[2])
 alarm = d["alarm"]                      # KeyError here is a failure, deliberately
-print(0 if alarm is None else 1,
+due = None if alarm is None else (alarm - now) / 1000
+push = 1 if due is not None and due < 3600 else 0
+print(push,
       d["push_tokens"],
       d["messages"],
       0 if d["push_attempt"] is None else 1,
-      "?" if alarm is None else int((alarm - now) / 1000))
+      int(due) if push else "?",
+      1 if due is not None and due > 86400 else 0)
 ' "$PROBE" "$NOW_MS" 2>/dev/null); then
     printf '  \033[31mFAIL\033[0m the inbox probe answered the wrong shape: this suite would pass vacuously\n'
     exit 1
   fi
-  read -r ALARMS TOKENS STORED ATTEMPTS NEXT_IN <<< "$READ"
+  read -r ALARMS TOKENS STORED ATTEMPTS NEXT_IN RETAIN <<< "$READ"
   [ "${KEEP:-0}" = "1" ] && { trap 'kill $DEV 2>/dev/null' EXIT; echo "  (state kept at $STATE)"; }
 else
 kill $DEV 2>/dev/null; wait $DEV 2>/dev/null; sleep 2
@@ -175,7 +178,12 @@ if ! sqlite3 "$META" "SELECT COUNT(*) FROM _cf_ALARM;" >/dev/null 2>&1; then
   printf '  \033[31mFAIL\033[0m cannot read _cf_ALARM at %s: this suite would pass vacuously\n' "$META"
   exit 1
 fi
-ALARMS=$(sqlite3 "$META" "SELECT COUNT(*) FROM _cf_ALARM;" 2>/dev/null)
+# The slot holds a push alarm (due within the hour) or a parked expiry alarm (a day or more
+# out, `armRetention`), never both. scheduled_time is nanoseconds.
+ALARMS=$(sqlite3 "$META" \
+  "SELECT COUNT(*) FROM _cf_ALARM WHERE scheduled_time/1000000 < $NOW_MS + 3600000;" 2>/dev/null)
+RETAIN=$(sqlite3 "$META" \
+  "SELECT COUNT(*) FROM _cf_ALARM WHERE scheduled_time/1000000 > $NOW_MS + 86400000;" 2>/dev/null)
 # Same readability rule as above: an unexpanded glob, renamed table or missing sqlite3 gives an
 # empty count, `${c:-0}` makes it zero, and "no push token stored" would check nothing.
 TOKENS=0
@@ -194,9 +202,10 @@ if [ "$INBOXES" -eq 0 ]; then
   printf '  \033[31mFAIL\033[0m no inbox databases found under %s\n' "$STATE/v3/do/mushroom-messaging-UserInbox"
   exit 1
 fi
-# scheduled_time is nanoseconds. How far out the next attempt is, in seconds.
+# How far out the next push attempt is, in seconds.
 NEXT_IN=$(sqlite3 "$META" \
-  "SELECT CAST((MAX(scheduled_time)/1000000 - $NOW_MS)/1000 AS INT) FROM _cf_ALARM;" 2>/dev/null)
+  "SELECT CAST((MIN(scheduled_time)/1000000 - $NOW_MS)/1000 AS INT) FROM _cf_ALARM
+   WHERE scheduled_time/1000000 < $NOW_MS + 3600000;" 2>/dev/null)
 STORED=0
 for f in "$STATE"/v3/do/mushroom-messaging-UserInbox/*.sqlite; do
   [ "$(basename "$f")" = "metadata.sqlite" ] && continue
@@ -263,9 +272,16 @@ if [ "$TOKENS" -ne 0 ]; then
 fi
 printf '  \033[32mok\033[0m   no push token stored without an APNs key\n'
 
-if [ "${ALARMS:-0}" -eq 0 ]; then
-  printf '  \033[32mok\033[0m   no push alarm armed without an APNs key\n'
+if [ "${ALARMS:-0}" -ne 0 ]; then
+  printf '  \033[31mFAIL\033[0m %s push alarm(s) armed without an APNs key: it will re-arm forever\n' "$ALARMS"
+  exit 1
+fi
+printf '  \033[32mok\033[0m   no push alarm armed without an APNs key\n'
+
+# Retention's own wake. Without it an inbox nobody writes to again keeps its ciphertext forever.
+if [ "${RETAIN:-0}" -ge 1 ]; then
+  printf '  \033[32mok\033[0m   the stored message has an expiry alarm, so an idle inbox still drops it\n'
   exit 0
 fi
-printf '  \033[31mFAIL\033[0m %s push alarm(s) armed without an APNs key: it will re-arm forever\n' "$ALARMS"
+printf '  \033[31mFAIL\033[0m no expiry alarm parked: an inbox nobody writes to again keeps its messages forever\n'
 exit 1
