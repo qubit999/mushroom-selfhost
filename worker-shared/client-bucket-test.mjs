@@ -11,4 +11,8 @@ for (const ip of ["2001:db8:aa:1::1", "2001:0db8:00aa:0001:ffff:1:2:3", "2001:DB
 assert.notEqual(clientBucket("2001:db8:aa:2::1"), net);
 assert.equal(clientBucket("::1"), "0:0:0:0::/64");
 assert.equal(clientBucket("2001:db8::"), "2001:db8:0:0::/64");
+// The /48 key for the coarse limit: neighbouring /64s share it, IPv4 is untouched.
+assert.equal(clientBucket("2001:db8:aa:1::1", 3), "2001:db8:aa::/48");
+assert.equal(clientBucket("2001:db8:aa:2::1", 3), clientBucket("2001:db8:aa:1::1", 3));
+assert.equal(clientBucket("203.0.113.9", 3), "203.0.113.9");
 console.log("client-bucket: ok");

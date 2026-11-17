@@ -2266,7 +2266,12 @@ export default {
       // a fresh bucket per request, and each bucket is a durable object on disk forever. One
       // bucket for the box; config.capnp.example sizes it.
       const ip = env.SELFHOST === "1" ? "box" : clientBucket(request.headers.get("cf-connecting-ip"));
-      if (!(await throttle(env, ip, "activate", activationsPerHourPerIP(env), 3600))) {
+      // And per /48 at ten times the limit, as in files-worker: a routed /48 holds 65,536 /64
+      // buckets. Same key as `ip` for IPv4 and the box, so counted once there.
+      const wide = env.SELFHOST === "1" ? ip : clientBucket(request.headers.get("cf-connecting-ip"), 3);
+      const limit = activationsPerHourPerIP(env);
+      if (!(await throttle(env, ip, "activate", limit, 3600))
+          || (wide !== ip && !(await throttle(env, wide, "activate48", limit * 10, 3600)))) {
         return fail(429, "rate_limited", { retry_after: 600 });
       }
       return activateDevice(request, env);

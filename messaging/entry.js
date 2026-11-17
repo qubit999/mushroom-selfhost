@@ -80,8 +80,8 @@ export class UserInbox extends BaseInbox {
     if (new URL(request.url).pathname === "/_selfhost/inbox") {
       const count = (sql) => this.ctx.storage.sql.exec(sql).one().n;
       return Response.json({
-        // Milliseconds, or null when nothing is armed. Null is the default scenario's
-        // assertion: a deployment that can't push must not wake on a timer forever.
+        // Milliseconds, or null when nothing is armed. alarm-test.sh tells a push alarm (due
+        // within the hour) from a parked expiry alarm (a day or more out) by how far out it is.
         alarm: await this.ctx.storage.getAlarm(),
         messages: count("SELECT COUNT(*) AS n FROM messages"),
         push_tokens: count("SELECT COUNT(*) AS n FROM devices WHERE apns_token IS NOT NULL"),
@@ -129,8 +129,12 @@ export class Admin extends WorkerEntrypoint {
         });
     }
 
-    // What alarm-test.sh asks instead of reading workerd's internal tables.
+    // What alarm-test.sh asks instead of reading workerd's internal tables. Test-only like the
+    // SQL route: it answers for any identity with no token, and under systemd the blob store
+    // runs as the same user beside this socket, so a compromised blobd could otherwise read
+    // every inbox's counts. That leaves `/_selfhost/cron`, which only runs the sweep early.
     if (url.pathname === "/_selfhost/inbox") {
+      if (this.env.SELFHOST_TEST_SQL !== "1") return new Response("not found\n", { status: 404 });
       const identity = url.searchParams.get("identity") ?? "";
       if (!identity) return new Response("identity required\n", { status: 400 });
       return this.env.INBOX.get(this.env.INBOX.idFromName(identity))

@@ -1747,7 +1747,13 @@ export default {
       // Self-hosted, nothing sets or strips cf-connecting-ip, so a client could pick a fresh
       // bucket per request. One bucket for the box instead.
       const ip = env.SELFHOST === "1" ? "box" : clientBucket(request.headers.get("cf-connecting-ip"));
-      if (!(await throttle(env, "activate", ip, activationsPerHourPerIP(env), 3600))) {
+      // And per /48 at ten times the limit, so a routed /48 can't spread across its 65,536
+      // /64 buckets, while a carrier prefix shared by many real customers stays clear of it.
+      // Same key as `ip` for IPv4 and the box, so counted once there.
+      const wide = env.SELFHOST === "1" ? ip : clientBucket(request.headers.get("cf-connecting-ip"), 3);
+      const limit = activationsPerHourPerIP(env);
+      if (!(await throttle(env, "activate", ip, limit, 3600))
+          || (wide !== ip && !(await throttle(env, "activate48", wide, limit * 10, 3600)))) {
         return fail(429, "rate_limited", { retry_after: 600 });
       }
       return activateDevice(request, env);
